@@ -131,23 +131,39 @@ else:
     gee_project_id = None
 
     if "Planetary Computer" in provider_choice:
-        st.sidebar.success("🟢 Provider Status: Active (No Login or Keys Required)")
+        st.sidebar.success("🟢 Provider Status: Active (Free Public COG Stream)")
     elif "Copernicus" in provider_choice:
-        st.sidebar.warning("🟡 CDSE OData Catalogue: Live | Pixel Download: Free Login Required")
-        with st.sidebar.expander("🔐 Optional CDSE Credentials"):
-            cdse_username = st.text_input("Copernicus Email / Username", value=os.environ.get("CDSE_USERNAME", ""))
-            cdse_password = st.text_input("Copernicus Password", type="password", value=os.environ.get("CDSE_PASSWORD", ""))
+        cdse_username = os.environ.get("CDSE_USERNAME", "")
+        cdse_password = os.environ.get("CDSE_PASSWORD", "")
+        with st.sidebar.expander("🔐 Copernicus CDSE Credentials", expanded=not (cdse_username and cdse_password)):
+            cdse_username = st.text_input("Copernicus Email / Username", value=cdse_username)
+            cdse_password = st.text_input("Copernicus Password", type="password", value=cdse_password)
             if cdse_username and cdse_password:
                 fetcher_auth = CopernicusCDSEFetcher(cdse_username, cdse_password)
                 if fetcher_auth.authenticate():
                     st.success("✅ CDSE Token Authenticated!")
                 else:
                     st.error("❌ CDSE Authentication failed. Check credentials.")
+            else:
+                st.caption("Register for free at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/)")
+        if cdse_username and cdse_password:
+            st.sidebar.success("🟢 CDSE Status: Authenticated & Active")
+        else:
+            st.sidebar.info("ℹ️ CDSE Status: OData Search Active (Streaming via STAC)")
     elif "Earth Engine" in provider_choice:
-        st.sidebar.warning("🟡 GEE Status: Requires Local Google Cloud Auth")
-        with st.sidebar.expander("🔐 Google Earth Engine Config"):
-            gee_project_id = st.text_input("GCP Project ID", value=os.environ.get("EE_PROJECT_ID", ""))
-            st.caption("Run `earthengine authenticate` in your local terminal to authorize access.")
+        gee_project_id = os.environ.get("EE_PROJECT_ID", "charged-atlas-457609-f3")
+        gee_fetcher = EarthEngineSARFetcher(project_id=gee_project_id)
+        is_gee_ok, gee_msg = gee_fetcher.initialize()
+        if is_gee_ok:
+            st.sidebar.success(f"🟢 GEE Status: Connected (`{gee_project_id}`)")
+        else:
+            st.sidebar.warning("🟡 GEE Status: Authorization Required")
+        with st.sidebar.expander("⚙️ Google Earth Engine Config", expanded=not is_gee_ok):
+            gee_project_id = st.text_input("GCP Project ID", value=gee_project_id)
+            if is_gee_ok:
+                st.caption("✅ Authorized with project: " + gee_project_id)
+            else:
+                st.caption(gee_msg)
 
     region_name = st.sidebar.selectbox(
         "Target Marine Region",
