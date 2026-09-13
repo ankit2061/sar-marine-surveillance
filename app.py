@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import numpy as np
 import scipy.ndimage as ndimage
-from skimage.filters import threshold_otsu
+# scikit-image threshold_otsu removed — replaced by statistical anomaly threshold (μ − k·σ)
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -134,36 +134,48 @@ def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
     return image_array
 
 
-def segment_oil_spill(
+def segment_oil_spill_statistical(
     filtered_sar_array: np.ndarray,
-    use_db: bool = True,
+    std_dev_multiplier: float = 2.0,
 ) -> dict:
     """
-    Automated dark-spot segmentation using Otsu's thresholding for marine oil
-    spill detection on despeckled SAR imagery.
+    Statistical anomaly dark-spot segmentation for marine oil spill detection
+    on despeckled SAR imagery.
+
+    Unlike Otsu's method (which assumes a clean bimodal histogram), this
+    approach models the ocean clutter distribution as approximately Gaussian
+    in the dB domain and flags any pixel whose backscatter falls more than
+    k standard deviations below the mean as a dark anomaly (potential oil).
+
+    Threshold formula:
+        threshold_db = mean_db − (std_dev_multiplier × std_db)
 
     The algorithm:
     1. Extracts valid water pixels (where ~np.isnan), ignoring DEM-masked land.
-    2. Optionally converts to dB scale (10·log10) for better bimodal histogram
-       separation between ocean clutter and damped-surface oil slicks.
-    3. Computes Otsu's optimal binarization threshold on valid water pixels only.
-    4. Classifies: pixel < threshold → Oil (1), pixel >= threshold → Ocean (0).
-    5. Preserves np.nan for land-masked pixels in the output.
+    2. Converts to dB scale: 10·log₁₀(clip(I, 1e-5)).
+    3. Computes mean_db and std_db of the valid water pixel distribution.
+    4. Derives threshold_db = mean_db − k·std_db.
+    5. Classifies: pixel < threshold → Oil (1), pixel ≥ threshold → Ocean (0).
+    6. Preserves np.nan for land-masked pixels in the output.
 
     Parameters
     ----------
     filtered_sar_array : np.ndarray
         2D despeckled SAR intensity array (e.g., Adaptive Lee output).
         May contain np.nan from coastal DEM land masking.
-    use_db : bool, default=True
-        If True, compute Otsu threshold in dB domain for better separation.
+    std_dev_multiplier : float, default=2.0
+        Number of standard deviations below the mean to set the detection
+        threshold.  Lower values (1.0–1.5) are more sensitive but prone to
+        false alarms; higher values (2.5–4.0) are conservative.
 
     Returns
     -------
     dict with keys:
         'binary_mask'  : np.ndarray of float — 1.0=Oil, 0.0=Ocean, np.nan=Land
-        'threshold_db' : float — Otsu threshold in dB
-        'threshold_lin': float — Otsu threshold in linear power
+        'threshold_db' : float — statistical anomaly threshold in dB
+        'threshold_lin': float — threshold converted to linear power
+        'mean_db'      : float — mean backscatter of valid water pixels (dB)
+        'std_db'        : float — std dev of valid water pixels (dB)
         'oil_pixels'   : int   — count of pixels classified as oil
         'water_pixels' : int   — count of valid (non-land) pixels
         'oil_pct'      : float — percentage of water area classified as oil
@@ -178,23 +190,27 @@ def segment_oil_spill(
             'binary_mask': empty,
             'threshold_db': 0.0,
             'threshold_lin': 0.0,
+            'mean_db': 0.0,
+            'std_db': 0.0,
             'oil_pixels': 0,
             'water_pixels': 0,
             'oil_pct': 0.0,
         }
 
-    # Convert to dB domain for better bimodal histogram separation
-    valid_db = 10.0 * np.log10(np.clip(valid, 1e-5, None))
+    # Convert to dB domain
     img_db = np.full_like(img, np.nan)
     img_db[~nan_mask] = 10.0 * np.log10(np.clip(img[~nan_mask], 1e-5, None))
+    valid_db = img_db[~nan_mask]
 
-    # Compute Otsu threshold on valid water pixels only
-    otsu_thresh_db = float(threshold_otsu(valid_db))
-    otsu_thresh_lin = 10.0 ** (otsu_thresh_db / 10.0)
+    # Statistical anomaly threshold: μ − k·σ
+    mean_db = float(np.mean(valid_db))
+    std_db = float(np.std(valid_db, ddof=1))
+    threshold_db = mean_db - (std_dev_multiplier * std_db)
+    threshold_lin = 10.0 ** (threshold_db / 10.0)
 
     # Classify: below threshold = Oil (1), above = Ocean (0)
     binary_mask = np.full(img.shape, np.nan, dtype=np.float64)
-    binary_mask[~nan_mask] = np.where(img_db[~nan_mask] < otsu_thresh_db, 1.0, 0.0)
+    binary_mask[~nan_mask] = np.where(valid_db < threshold_db, 1.0, 0.0)
 
     oil_count = int(np.nansum(binary_mask == 1.0))
     water_count = int(np.sum(~nan_mask))
@@ -202,8 +218,10 @@ def segment_oil_spill(
 
     return {
         'binary_mask': binary_mask,
-        'threshold_db': otsu_thresh_db,
-        'threshold_lin': otsu_thresh_lin,
+        'threshold_db': threshold_db,
+        'threshold_lin': threshold_lin,
+        'mean_db': mean_db,
+        'std_db': std_db,
         'oil_pixels': oil_count,
         'water_pixels': water_count,
         'oil_pct': oil_pct,
@@ -703,23 +721,37 @@ with tab4:
 with tab5:
     st.markdown("### 🛢️ Path A: Automated Dark-Spot Oil Spill Segmentation")
     st.caption(
-        "Otsu's method computes an optimal binarization threshold by maximizing "
-        "inter-class variance between the ocean clutter and damped-surface oil slick "
-        "intensity distributions. The Adaptive Lee–filtered SAR image is used as input "
-        "to minimize false alarms from residual speckle."
+        "Statistical anomaly detection flags any pixel whose dB backscatter falls "
+        "more than k standard deviations below the ocean mean as a dark anomaly "
+        "(potential oil spill). Unlike Otsu's method, this approach is robust to "
+        "non-bimodal SAR histograms common in live Sentinel-1 data."
+    )
+
+    # Anomaly multiplier slider
+    std_dev_k = st.slider(
+        "Standard Deviation Anomaly Multiplier (k)",
+        min_value=1.0,
+        max_value=4.0,
+        value=2.5,
+        step=0.1,
+        help=(
+            "Detection threshold = μ_dB − k·σ_dB.  "
+            "Lower k (1.0–1.5) catches fainter slicks but increases false alarms.  "
+            "Higher k (3.0–4.0) is conservative, detecting only the darkest anomalies."
+        ),
     )
 
     # Run segmentation on the Lee-filtered output
     lee_filtered = filtered_dict[lee_name]
-    seg_result = segment_oil_spill(lee_filtered, use_db=True)
+    seg_result = segment_oil_spill_statistical(lee_filtered, std_dev_multiplier=std_dev_k)
 
     # --- Metrics Row ---
     seg_c1, seg_c2, seg_c3, seg_c4 = st.columns(4)
     with seg_c1:
         st.metric(
-            "Otsu Threshold",
+            "Statistical Threshold",
             f"{seg_result['threshold_db']:.2f} dB",
-            delta=f"Linear: {seg_result['threshold_lin']:.6f}",
+            delta=f"μ={seg_result['mean_db']:.1f} dB, σ={seg_result['std_db']:.1f} dB",
             delta_color="off",
         )
     with seg_c2:
@@ -839,8 +871,8 @@ with tab5:
     plt.subplots_adjust(left=0.04, right=0.92, top=0.92, bottom=0.06)
     st.pyplot(fig_seg, clear_figure=True)
 
-    # --- Histogram: Water pixel dB distribution with Otsu threshold line ---
-    st.markdown("#### 📊 Water Pixel Intensity Distribution & Otsu Decision Boundary")
+    # --- Histogram: Water pixel dB distribution with statistical threshold ---
+    st.markdown("#### 📊 Water Pixel Intensity Distribution & Statistical Decision Boundary")
     if valid_lee.size > 20:
         fig_hist, ax_hist = plt.subplots(figsize=(10, 4), facecolor="#14171A")
         ax_hist.set_facecolor("#0F1115")
@@ -850,15 +882,22 @@ with tab5:
             edgecolor="#0D47A1", linewidth=0.4,
         )
 
-        # Color bins below Otsu threshold in yellow (oil side)
+        # Color bins below threshold in yellow (oil side)
         for patch, left_edge in zip(bar_patches, bin_edges[:-1]):
             if left_edge < seg_result['threshold_db']:
                 patch.set_facecolor("#FFD700")
                 patch.set_edgecolor("#F9A825")
 
+        # Mean line
+        ax_hist.axvline(
+            seg_result['mean_db'], color="#00E5FF", linewidth=1.8,
+            linestyle="-", alpha=0.7, label=f"μ = {seg_result['mean_db']:.2f} dB",
+        )
+
+        # Threshold line
         ax_hist.axvline(
             seg_result['threshold_db'], color="#FF3366", linewidth=2.5,
-            linestyle="--", label=f"Otsu Threshold = {seg_result['threshold_db']:.2f} dB",
+            linestyle="--", label=f"Threshold (μ−{std_dev_k:.1f}σ) = {seg_result['threshold_db']:.2f} dB",
         )
         ax_hist.fill_betweenx(
             [0, counts.max() * 1.05],
@@ -885,7 +924,7 @@ with tab5:
         ax_hist.set_xlabel("Backscatter Intensity (dB)", color="#E1E8ED", fontsize=10)
         ax_hist.set_ylabel("Pixel Count", color="#E1E8ED", fontsize=10)
         ax_hist.set_title(
-            "Bimodal Histogram of Lee-Filtered Water Pixels (dB Domain)",
+            f"Lee-Filtered Water Pixel Distribution (dB) — Anomaly Threshold at μ−{std_dev_k:.1f}σ",
             color="#F5F8FA", fontsize=12, fontweight="bold",
         )
         ax_hist.legend(
