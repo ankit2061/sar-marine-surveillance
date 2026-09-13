@@ -9,7 +9,7 @@ Run via:
     streamlit run app.py
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import numpy as np
 import scipy.ndimage as ndimage
@@ -189,10 +189,10 @@ else:
             init_start = datetime.strptime(region_info["default_dates"][0], "%Y-%m-%d").date()
             init_end = datetime.strptime(region_info["default_dates"][1], "%Y-%m-%d").date()
         else:
-            init_end = datetime.utcnow().date()
+            init_end = datetime.now(timezone.utc).date()
             init_start = init_end - timedelta(days=45)
     else:
-        init_end = datetime.utcnow().date()
+        init_end = datetime.now(timezone.utc).date()
         init_start = init_end - timedelta(days=45)
         c1, c2 = st.sidebar.columns(2)
         min_lon = c1.number_input("Min Longitude", value=57.65, format="%.4f")
