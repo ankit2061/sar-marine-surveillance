@@ -185,22 +185,28 @@ else:
         region_info = PRESET_MARINE_REGIONS[region_name]
         default_bbox = region_info["bbox"]
         st.sidebar.info(region_info["description"])
+        if "default_dates" in region_info:
+            init_start = datetime.strptime(region_info["default_dates"][0], "%Y-%m-%d").date()
+            init_end = datetime.strptime(region_info["default_dates"][1], "%Y-%m-%d").date()
+        else:
+            init_end = datetime.utcnow().date()
+            init_start = init_end - timedelta(days=45)
     else:
+        init_end = datetime.utcnow().date()
+        init_start = init_end - timedelta(days=45)
         c1, c2 = st.sidebar.columns(2)
-        min_lon = c1.number_input("Min Longitude", value=72.2)
-        min_lat = c2.number_input("Min Latitude", value=19.4)
-        max_lon = c1.number_input("Max Longitude", value=72.7)
-        max_lat = c2.number_input("Max Latitude", value=19.8)
+        min_lon = c1.number_input("Min Longitude", value=57.65, format="%.4f")
+        min_lat = c2.number_input("Min Latitude", value=-20.55, format="%.4f")
+        max_lon = c1.number_input("Max Longitude", value=57.85, format="%.4f")
+        max_lat = c2.number_input("Max Latitude", value=-20.35, format="%.4f")
         default_bbox = [min_lon, min_lat, max_lon, max_lat]
 
     polarization = st.sidebar.selectbox("SAR Polarization", ["VV (Best for Slicks & Surface Roughness)", "VH (Cross-pol, Best for Ships)"], index=0)
     pol_code = "vv" if "VV" in polarization else "vh"
 
     st.sidebar.markdown("#### Acquisition Date Range")
-    end_dt = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=45)
-    d_start = st.sidebar.date_input("Start Date", value=start_dt.date())
-    d_end = st.sidebar.date_input("End Date", value=end_dt.date())
+    d_start = st.sidebar.date_input("Start Date", value=init_start)
+    d_end = st.sidebar.date_input("End Date", value=init_end)
 
     n_looks = 4  # Sentinel-1 IW GRD nominal looks
     is_synthetic = False
@@ -229,12 +235,14 @@ else:
                     st.warning(f"GEE Fetch notice: {e}. Streaming via STAC COG layer.")
 
         # Default fast public streaming layer: Microsoft Planetary Computer STAC
+        # Enforces high-resolution Interferometric Wide (IW, 10m) mode data
         fetcher = PlanetaryComputerSARFetcher()
-        scenes = fetcher.search_scenes(bbox=bbox, start_date=start_str, end_date=end_str, max_items=5)
+        scenes = fetcher.search_scenes(bbox=bbox, start_date=start_str, end_date=end_str, max_items=5, instrument_mode="IW")
         if not scenes:
-            scenes = fetcher.search_scenes(bbox=bbox, start_date="2024-01-01", end_date="2024-03-31", max_items=5)
+            # Fallback to any mode (e.g. EW) if no IW swath exists over open ocean
+            scenes = fetcher.search_scenes(bbox=bbox, start_date=start_str, end_date=end_str, max_items=5, instrument_mode=None)
         if not scenes:
-            raise RuntimeError(f"No Sentinel-1 GRD scenes found over bbox {bbox} in date range.")
+            raise RuntimeError(f"No Sentinel-1 GRD scenes found over bbox {bbox} in date range {start_str} to {end_str}.")
         
         target_scene = scenes[0]
         img, meta = fetcher.stream_subwindow(

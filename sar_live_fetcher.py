@@ -29,6 +29,13 @@ load_dotenv()
 
 # Curated high-interest marine surveillance corridors
 PRESET_MARINE_REGIONS = {
+    "Mauritius (MV Wakashio Oil Spill - Aug 2020)": {
+        "bbox": [57.65, -20.55, 57.85, -20.35],
+        "description": "Historical disaster: MV Wakashio bulk carrier grounded on reef at Pointe d'Esny with heavy fuel oil slick.",
+        "center_lat": -20.44,
+        "center_lon": 57.75,
+        "default_dates": ("2020-08-01", "2020-08-15"),
+    },
     "Mumbai High Offshore (Arabian Sea)": {
         "bbox": [72.20, 19.40, 72.70, 19.85],
         "description": "Major offshore oil & gas production field with active support vessels and platforms.",
@@ -82,14 +89,22 @@ class PlanetaryComputerSARFetcher:
         start_date: str,
         end_date: str,
         max_items: int = 5,
+        instrument_mode: Optional[str] = "IW",
     ) -> List[Dict]:
         """
         Queries Sentinel-1 GRD scenes intersecting the bounding box within date range.
+        Filters by sar:instrument_mode (defaults to 'IW' for high-resolution 10m data,
+        filtering out coarse Extra Wide EW 40m scenes).
         """
+        query_dict = {}
+        if instrument_mode:
+            query_dict["sar:instrument_mode"] = {"eq": instrument_mode}
+
         search = self.client.search(
             collections=["sentinel-1-grd"],
             bbox=bbox,
             datetime=f"{start_date}/{end_date}",
+            query=query_dict if query_dict else None,
             max_items=max_items,
         )
         items = list(search.items())
