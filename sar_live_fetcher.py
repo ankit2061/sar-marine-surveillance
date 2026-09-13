@@ -76,12 +76,20 @@ class PlanetaryComputerSARFetcher:
     def __init__(self):
         import pystac_client
         import planetary_computer
+        import time
 
         self.stac_endpoint = "https://planetarycomputer.microsoft.com/api/stac/v1"
-        self.client = pystac_client.Client.open(
-            self.stac_endpoint,
-            modifier=planetary_computer.sign_inplace,
-        )
+        for attempt in range(3):
+            try:
+                self.client = pystac_client.Client.open(
+                    self.stac_endpoint,
+                    modifier=planetary_computer.sign_inplace,
+                )
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5)
 
     def search_scenes(
         self,
@@ -96,18 +104,28 @@ class PlanetaryComputerSARFetcher:
         Filters by sar:instrument_mode (defaults to 'IW' for high-resolution 10m data,
         filtering out coarse Extra Wide EW 40m scenes).
         """
+        import time
+
         query_dict = {}
         if instrument_mode:
             query_dict["sar:instrument_mode"] = {"eq": instrument_mode}
 
-        search = self.client.search(
-            collections=["sentinel-1-grd"],
-            bbox=bbox,
-            datetime=f"{start_date}/{end_date}",
-            query=query_dict if query_dict else None,
-            max_items=max_items,
-        )
-        items = list(search.items())
+        items = []
+        for attempt in range(3):
+            try:
+                search = self.client.search(
+                    collections=["sentinel-1-grd"],
+                    bbox=bbox,
+                    datetime=f"{start_date}/{end_date}",
+                    query=query_dict if query_dict else None,
+                    max_items=max_items,
+                )
+                items = list(search.items())
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5)
 
         scene_summaries = []
         for item in items:
