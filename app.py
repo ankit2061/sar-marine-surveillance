@@ -92,9 +92,36 @@ contrast_percentile = st.sidebar.slider(
     step=0.1,
 )
 
+def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
+    """
+    Applies radiometric scaling to a 2D SAR backscatter intensity array.
+
+    Parameters
+    ----------
+    image_array : np.ndarray
+        Input 2D radar intensity array.
+    scale_mode : str
+        'Linear Power' or 'Decibels (dB)'.
+
+    Returns
+    -------
+    np.ndarray
+        Transformed array. In dB mode, clips to 1e-5 to prevent log(0) warnings.
+    """
+    if scale_mode == "Decibels (dB)":
+        return 10.0 * np.log10(np.clip(image_array, 1e-5, None))
+    return image_array
+
+
 # ==============================================================================
 # DATA LOADING BASED ON SELECTED MODE
 # ==============================================================================
+
+sar_array = None
+clean_scene = None
+vessel_coords = []
+is_synthetic = False
+scene_source_title = ""
 
 if data_mode == "🧪 Synthetic Physics Simulation":
     st.sidebar.markdown("### 🕹️ Simulation Parameters")
@@ -119,11 +146,15 @@ if data_mode == "🧪 Synthetic Physics Simulation":
         spill_backscatter=spill_backscatter,
         seed=seed,
     )
+    sar_array = noisy_scene
     scene_source_title = f"Synthetic Simulation (L={n_looks}, Seed={seed})"
     is_synthetic = True
 
 else:
     # --- LIVE SATELLITE INGESTION MODE ---
+    is_synthetic = False
+    vessel_coords = []  # Explicitly disable synthetic targets
+
     st.sidebar.markdown("### 🛰️ Live Satellite Provider")
     provider_choice = st.sidebar.selectbox(
         "Satellite Data Provider",
@@ -255,7 +286,7 @@ else:
 
     try:
         with st.spinner("Streaming real Sentinel-1 SAR subwindow from orbit via STAC..."):
-            noisy_scene, live_meta, acq_time, scene_id, cdse_info = fetch_live_sar_data(
+            downloaded_img, live_meta, acq_time, scene_id, cdse_info = fetch_live_sar_data(
                 provider_choice,
                 default_bbox,
                 d_start.strftime("%Y-%m-%d"),
@@ -265,27 +296,29 @@ else:
                 cdse_password,
                 gee_project_id,
             )
-            clean_scene = noisy_scene.copy()  # Ground truth is unknown in real satellite data
+            # Strictly overwrite sar_array with the downloaded 2D satellite array
+            sar_array = np.array(downloaded_img, dtype=np.float64)
+            clean_scene = sar_array.copy()
             scene_source_title = f"Live Sentinel-1 GRD ({pol_code.upper()}) | {acq_time}"
 
-            # Auto-detect real targets (ships/rigs) in the satellite scene
-            vessel_coords = find_bright_targets(noisy_scene, threshold_factor=4.5)
-            if not vessel_coords:
-                vessel_coords = [(256, 256)]
             # Designate an ocean clutter patch for real ENL measurement
-            ocean_patch_slice = (slice(20, 140), slice(20, 140))
+            h_sar, w_sar = sar_array.shape
+            ocean_patch_slice = (
+                slice(int(h_sar * 0.05), int(h_sar * 0.25)),
+                slice(int(w_sar * 0.05), int(w_sar * 0.25)),
+            )
 
             st.success(f"📡 Ingested Live Sentinel-1 Scene: **{scene_id}** ({acq_time})")
             if cdse_info:
                 st.info(f"🇪🇺 **Copernicus CDSE OData Feed**: {cdse_info}")
 
     except Exception as e:
-        st.error(f"Live fetch error: {e}. Falling back to high-fidelity simulation.")
-        clean_scene, noisy_scene, vessel_coords, ocean_patch_slice = generate_synthetic_sar_scene(
-            shape=(512, 512), n_looks=4, seed=42
-        )
-        scene_source_title = "Synthetic Fallback Scene"
-        is_synthetic = True
+        st.error(f"Live satellite fetch error: {e}. Please check your connection or date range.")
+        st.stop()
+
+if sar_array is None:
+    st.warning("No SAR array loaded. Please select an input source.")
+    st.stop()
 
 # ==============================================================================
 # FILTER EXECUTION & METRIC CALCULATION
@@ -295,18 +328,19 @@ mean_name = f"Mean ({window_size}x{window_size})"
 gauss_name = f"Gaussian (σ={gaussian_sigma:.1f})"
 lee_name = f"Adaptive Lee ({window_size}x{window_size})"
 
+# Downstream spatial filters strictly operate on sar_array
 filtered_dict = {
-    mean_name: mean_filter(noisy_scene, window_size=window_size),
-    gauss_name: gaussian_filter(noisy_scene, sigma=gaussian_sigma),
-    lee_name: lee_filter(noisy_scene, window_size=window_size, n_looks=n_looks),
+    mean_name: mean_filter(sar_array, window_size=window_size),
+    gauss_name: gaussian_filter(sar_array, sigma=gaussian_sigma),
+    lee_name: lee_filter(sar_array, window_size=window_size, n_looks=n_looks),
 }
 
 # Metrics
 metrics = evaluate_filter_performance(
-    clean_scene,
-    noisy_scene,
+    clean_scene if clean_scene is not None else sar_array,
+    sar_array,
     filtered_dict,
-    vessel_coords,
+    vessel_coords if is_synthetic else [],
     ocean_patch_slice,
 )
 
@@ -316,17 +350,22 @@ metrics = evaluate_filter_performance(
 
 st.markdown(f"### 📊 Live Radiometric Dashboard: *{scene_source_title}*")
 raw_enl = metrics["ENL"]["Raw Speckled SAR"]
-top_vessel_ret = {k: metrics["Vessels"][0]["retention_pct"][k] for k in filtered_dict}
+has_vessels = is_synthetic and len(metrics.get("Vessels", [])) > 0
+if has_vessels:
+    top_vessel_ret = {k: metrics["Vessels"][0]["retention_pct"][k] for k in filtered_dict}
 
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 with col_m1:
     st.metric("Raw SAR Ocean ENL", f"{raw_enl:.2f}", delta="Baseline Speckle", delta_color="off")
 with col_m2:
-    st.metric(f"Mean ({window_size}x{window_size}) ENL", f"{metrics['ENL'][mean_name]:.2f}", delta=f"Target Peak: {top_vessel_ret[mean_name]:.1f}%", delta_color="inverse")
+    delta_val = f"Target Peak: {top_vessel_ret[mean_name]:.1f}%" if has_vessels else f"+{(metrics['ENL'][mean_name] - raw_enl):.2f} ENL"
+    st.metric(f"Mean ({window_size}x{window_size}) ENL", f"{metrics['ENL'][mean_name]:.2f}", delta=delta_val, delta_color="inverse" if has_vessels else "normal")
 with col_m3:
-    st.metric(f"Gaussian (σ={gaussian_sigma:.1f}) ENL", f"{metrics['ENL'][gauss_name]:.2f}", delta=f"Target Peak: {top_vessel_ret[gauss_name]:.1f}%", delta_color="inverse")
+    delta_val = f"Target Peak: {top_vessel_ret[gauss_name]:.1f}%" if has_vessels else f"+{(metrics['ENL'][gauss_name] - raw_enl):.2f} ENL"
+    st.metric(f"Gaussian (σ={gaussian_sigma:.1f}) ENL", f"{metrics['ENL'][gauss_name]:.2f}", delta=delta_val, delta_color="inverse" if has_vessels else "normal")
 with col_m4:
-    st.metric(f"Adaptive Lee ({window_size}x{window_size}) ENL", f"{metrics['ENL'][lee_name]:.2f}", delta=f"Target Peak: {top_vessel_ret[lee_name]:.1f}%", delta_color="normal")
+    delta_val = f"Target Peak: {top_vessel_ret[lee_name]:.1f}%" if has_vessels else f"+{(metrics['ENL'][lee_name] - raw_enl):.2f} ENL"
+    st.metric(f"Adaptive Lee ({window_size}x{window_size}) ENL", f"{metrics['ENL'][lee_name]:.2f}", delta=delta_val, delta_color="normal")
 
 # ==============================================================================
 # VISUALIZATION TABS
@@ -339,93 +378,80 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🛰️ Satellite API & Provider Details",
 ])
 
-def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
-    """
-    Applies radiometric scaling to a 2D SAR backscatter intensity array.
-
-    Parameters
-    ----------
-    image_array : np.ndarray
-        Input 2D radar intensity array.
-    scale_mode : str
-        'Linear Power' or 'Decibels (dB)'.
-
-    Returns
-    -------
-    np.ndarray
-        Transformed array. In dB mode, clips to 1e-5 to prevent log(0) warnings.
-    """
-    if scale_mode == "Decibels (dB)":
-        return 10.0 * np.log10(np.clip(image_array, 1e-5, None))
-    return image_array
-
 with tab1:
     fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor="#14171A")
 
-    # Apply selected radiometric scaling directly before rendering in matplotlib
-    scaled_noisy = apply_scaling(noisy_scene, scale_mode)
+    # Strictly apply selected radiometric scaling directly before rendering in matplotlib
+    scaled_raw = apply_scaling(sar_array, scale_mode)
     scaled_mean = apply_scaling(filtered_dict[mean_name], scale_mode)
     scaled_gauss = apply_scaling(filtered_dict[gauss_name], scale_mode)
     scaled_lee = apply_scaling(filtered_dict[lee_name], scale_mode)
 
     plot_configs = [
-        (f"Raw Input ({scene_source_title[:28]})", scaled_noisy, axes[0, 0], raw_enl, 100.0),
-        (f"Mean Box Filter ({window_size}x{window_size})", scaled_mean, axes[0, 1], metrics["ENL"][mean_name], top_vessel_ret[mean_name]),
-        (f"Gaussian Filter (σ={gaussian_sigma:.1f})", scaled_gauss, axes[1, 0], metrics["ENL"][gauss_name], top_vessel_ret[gauss_name]),
-        (f"Adaptive Lee Filter ({window_size}x{window_size})", scaled_lee, axes[1, 1], metrics["ENL"][lee_name], top_vessel_ret[lee_name]),
+        (f"Raw Input ({scene_source_title[:28]})", scaled_raw, axes[0, 0], raw_enl),
+        (f"Mean Box Filter ({window_size}x{window_size})", scaled_mean, axes[0, 1], metrics["ENL"][mean_name]),
+        (f"Gaussian Filter (σ={gaussian_sigma:.1f})", scaled_gauss, axes[1, 0], metrics["ENL"][gauss_name]),
+        (f"Adaptive Lee Filter ({window_size}x{window_size})", scaled_lee, axes[1, 1], metrics["ENL"][lee_name]),
     ]
 
     y_slice, x_slice = ocean_patch_slice
     roi_x, roi_y = x_slice.start, y_slice.start
     roi_w, roi_h = x_slice.stop - x_slice.start, y_slice.stop - y_slice.start
 
-    # Adjust dynamic display range based on linear or logarithmic (dB) scale
+    # Dynamic display range based on linear or logarithmic (dB) scale
     if scale_mode == "Decibels (dB)":
-        v_min = float(np.percentile(scaled_noisy, 1.0))
-        v_max = float(np.percentile(scaled_noisy, contrast_percentile))
+        v_min = float(np.percentile(scaled_raw, 2.0))
+        v_max = float(np.percentile(scaled_raw, contrast_percentile))
     else:
-        v_min = 0.0
-        v_max = float(np.percentile(scaled_noisy, contrast_percentile))
+        v_min = float(np.percentile(scaled_raw, 1.0))
+        v_max = float(np.percentile(scaled_raw, contrast_percentile))
 
-    ship1_r, ship1_c = vessel_coords[0]
-    inset_half_size = 22
-    r_min, r_max = max(0, ship1_r - inset_half_size), min(512, ship1_r + inset_half_size)
-    c_min, c_max = max(0, ship1_c - inset_half_size), min(512, ship1_c + inset_half_size)
-
-    for title, img, ax, enl_val, ship_ret in plot_configs:
+    for title, img, ax, enl_val in plot_configs:
         ax.set_facecolor("#0F1115")
         im = ax.imshow(img, cmap=colormap, vmin=v_min, vmax=v_max, origin="upper")
         ax.set_title(title, color="#F5F8FA", fontsize=12, fontweight="bold", pad=10)
 
-        # Highlight Ocean Patch
+        # Highlight Ocean ENL ROI
         rect = patches.Rectangle((roi_x, roi_y), roi_w, roi_h, linewidth=1.5, edgecolor="#00E5FF", facecolor="none", linestyle="--")
         ax.add_patch(rect)
         ax.text(roi_x + 5, roi_y + 16, "Ocean ENL ROI", color="#00E5FF", fontsize=8.5, fontweight="bold")
 
-        # Highlight Targets
-        for idx, (r, c) in enumerate(vessel_coords[:4], start=1):
-            circle = patches.Circle((c, r), radius=10, linewidth=1.5, edgecolor="#FF3366", facecolor="none")
-            ax.add_patch(circle)
-            ax.text(c + 12, r + 4, f"Target #{idx}", color="#FF3366", fontsize=8.5, fontweight="bold")
+        # Highlight Targets ONLY in synthetic mode (disabled in Live Satellite mode)
+        if is_synthetic and vessel_coords:
+            for idx, (r, c) in enumerate(vessel_coords[:4], start=1):
+                circle = patches.Circle((c, r), radius=10, linewidth=1.5, edgecolor="#FF3366", facecolor="none")
+                ax.add_patch(circle)
+                ax.text(c + 12, r + 4, f"Target #{idx}", color="#FF3366", fontsize=8.5, fontweight="bold")
 
         # Badge Card
         badge_color = "#00E676" if ("Lee" in title or "Raw" in title) else "#FF9100"
+        if is_synthetic and has_vessels:
+            ship_ret = 100.0 if "Raw" in title else metrics["Vessels"][0]["retention_pct"].get(title.split(" (")[0], 100.0)
+            card_text = f"ENL: {enl_val:5.1f}\nPeak Ret: {ship_ret:4.1f}%"
+        else:
+            card_text = f"ENL: {enl_val:5.1f}\nMode: Live SAR"
+
         ax.text(
-            0.97, 0.96, f"ENL: {enl_val:5.1f}\nPeak Ret: {ship_ret:4.1f}%",
+            0.97, 0.96, card_text,
             transform=ax.transAxes, color="#FFFFFF", fontsize=9, fontweight="bold",
             va="top", ha="right",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="#1F242D", edgecolor=badge_color, linewidth=1.4, alpha=0.9),
         )
 
-        # Inset Box over primary target
-        if r_max - r_min > 5 and c_max - c_min > 5:
-            ax_ins = inset_axes(ax, width="28%", height="28%", loc="lower right", bbox_to_anchor=(0.0, 0.0, 1.0, 1.0), bbox_transform=ax.transAxes, borderpad=0.6)
-            ax_ins.imshow(img[r_min:r_max, c_min:c_max], cmap=colormap, vmin=v_min, vmax=v_max, origin="upper")
-            ax_ins.set_xticks([])
-            ax_ins.set_yticks([])
-            for s in ax_ins.spines.values():
-                s.set_edgecolor("#00E5FF")
-                s.set_linewidth(1.3)
+        # Inset Box over primary target ONLY in synthetic simulation mode
+        if is_synthetic and vessel_coords:
+            ship1_r, ship1_c = vessel_coords[0]
+            inset_half_size = 22
+            r_min, r_max = max(0, ship1_r - inset_half_size), min(sar_array.shape[0], ship1_r + inset_half_size)
+            c_min, c_max = max(0, ship1_c - inset_half_size), min(sar_array.shape[1], ship1_c + inset_half_size)
+            if r_max - r_min > 5 and c_max - c_min > 5:
+                ax_ins = inset_axes(ax, width="28%", height="28%", loc="lower right", bbox_to_anchor=(0.0, 0.0, 1.0, 1.0), bbox_transform=ax.transAxes, borderpad=0.6)
+                ax_ins.imshow(img[r_min:r_max, c_min:c_max], cmap=colormap, vmin=v_min, vmax=v_max, origin="upper")
+                ax_ins.set_xticks([])
+                ax_ins.set_yticks([])
+                for s in ax_ins.spines.values():
+                    s.set_edgecolor("#00E5FF")
+                    s.set_linewidth(1.3)
 
         ax.tick_params(colors="#8899A6", labelsize=8)
         for s in ax.spines.values():
@@ -445,41 +471,44 @@ with tab1:
     st.pyplot(fig, clear_figure=True)
 
 with tab2:
-    ship_r, ship_c = vessel_coords[0]
-    half_span = 30
-    c_start = max(0, ship_c - half_span)
-    c_end = min(512, ship_c + half_span)
-    cols = np.arange(c_start, c_end)
+    if is_synthetic and vessel_coords:
+        transect_r, transect_c = vessel_coords[0]
+        half_span = 30
+        c_start = max(0, transect_c - half_span)
+        c_end = min(sar_array.shape[1], transect_c + half_span)
+        cols = np.arange(c_start, c_end)
+        transect_title = f"1D Radiometric Transect Across Target (Row {transect_r})"
+    else:
+        transect_r = sar_array.shape[0] // 2
+        cols = np.arange(0, sar_array.shape[1])
+        transect_title = f"1D Radiometric Transect Across Scene (Row {transect_r})"
 
     fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), facecolor="#14171A", sharex=True)
 
-    n_slice = noisy_scene[ship_r, cols]
-    m_slice = filtered_dict[mean_name][ship_r, cols]
-    g_slice = filtered_dict[gauss_name][ship_r, cols]
-    l_slice = filtered_dict[lee_name][ship_r, cols]
+    n_slice = sar_array[transect_r, cols]
+    m_slice = filtered_dict[mean_name][transect_r, cols]
+    g_slice = filtered_dict[gauss_name][transect_r, cols]
+    l_slice = filtered_dict[lee_name][transect_r, cols]
 
     # Linear Transect
     ax1.set_facecolor("#0F1115")
-    if is_synthetic:
-        ax1.plot(cols, clean_scene[ship_r, cols], label="Ground Truth (Clean)", color="#FFFFFF", linestyle="--", linewidth=1.5)
+    if is_synthetic and clean_scene is not None:
+        ax1.plot(cols, clean_scene[transect_r, cols], label="Ground Truth (Clean)", color="#FFFFFF", linestyle="--", linewidth=1.5)
     ax1.plot(cols, n_slice, label="Raw SAR Input", color="#78909C", linewidth=1.0, alpha=0.6)
     ax1.plot(cols, m_slice, label=f"Mean ({window_size}x{window_size})", color="#FF3D71", linewidth=2.0)
     ax1.plot(cols, g_slice, label=f"Gaussian (σ={gaussian_sigma:.1f})", color="#FFA726", linewidth=2.0)
     ax1.plot(cols, l_slice, label=f"Adaptive Lee ({window_size}x{window_size})", color="#00E5FF", linewidth=2.2)
     ax1.set_ylabel("Linear Radar Intensity", color="#E1E8ED")
-    ax1.set_title(f"1D Radiometric Transect Across Target (Row {ship_r})", color="#F5F8FA", fontsize=12, fontweight="bold")
+    ax1.set_title(transect_title, color="#F5F8FA", fontsize=12, fontweight="bold")
     ax1.grid(True, color="#263238", linestyle=":")
     ax1.legend(facecolor="#1F242D", edgecolor="#38444D", labelcolor="#E1E8ED")
 
     # Decibel Transect
-    def to_db(arr):
-        return 10.0 * np.log10(np.maximum(1e-4, arr))
-
     ax2.set_facecolor("#0F1115")
-    ax2.plot(cols, to_db(n_slice), color="#78909C", linewidth=1.0, alpha=0.6)
-    ax2.plot(cols, to_db(m_slice), color="#FF3D71", linewidth=2.0)
-    ax2.plot(cols, to_db(g_slice), color="#FFA726", linewidth=2.0)
-    ax2.plot(cols, to_db(l_slice), color="#00E5FF", linewidth=2.2)
+    ax2.plot(cols, apply_scaling(n_slice, "Decibels (dB)"), color="#78909C", linewidth=1.0, alpha=0.6)
+    ax2.plot(cols, apply_scaling(m_slice, "Decibels (dB)"), color="#FF3D71", linewidth=2.0)
+    ax2.plot(cols, apply_scaling(g_slice, "Decibels (dB)"), color="#FFA726", linewidth=2.0)
+    ax2.plot(cols, apply_scaling(l_slice, "Decibels (dB)"), color="#00E5FF", linewidth=2.2)
     ax2.set_ylabel("Backscatter (dB = 10·log₁₀(I))", color="#E1E8ED")
     ax2.set_xlabel("Pixel Column Coordinate", color="#E1E8ED")
     ax2.grid(True, color="#263238", linestyle=":")
@@ -493,17 +522,34 @@ with tab2:
     st.pyplot(fig2, clear_figure=True)
 
 with tab3:
-    st.markdown("#### Detected Target Radiometric Retention Summary")
-    data_table = []
-    for v in metrics["Vessels"]:
-        data_table.append({
-            "Target ID": f"Target #{v['vessel_id']} @ {v['coord']}",
-            "Raw SAR Peak": f"{v['noisy_peak']:.2f}",
-            f"{mean_name} Peak": f"{v['peaks'][mean_name]:.2f} ({v['retention_pct'][mean_name]:.1f}%)",
-            f"{gauss_name} Peak": f"{v['peaks'][gauss_name]:.2f} ({v['retention_pct'][gauss_name]:.1f}%)",
-            f"{lee_name} Peak": f"{v['peaks'][lee_name]:.2f} ({v['retention_pct'][lee_name]:.1f}%)",
-        })
-    st.table(data_table)
+    if is_synthetic and has_vessels:
+        st.markdown("#### Detected Target Radiometric Retention Summary")
+        data_table = []
+        for v in metrics["Vessels"]:
+            data_table.append({
+                "Target ID": f"Target #{v['vessel_id']} @ {v['coord']}",
+                "Raw SAR Peak": f"{v['noisy_peak']:.2f}",
+                f"{mean_name} Peak": f"{v['peaks'][mean_name]:.2f} ({v['retention_pct'][mean_name]:.1f}%)",
+                f"{gauss_name} Peak": f"{v['peaks'][gauss_name]:.2f} ({v['retention_pct'][gauss_name]:.1f}%)",
+                f"{lee_name} Peak": f"{v['peaks'][lee_name]:.2f} ({v['retention_pct'][lee_name]:.1f}%)",
+            })
+        st.table(data_table)
+    else:
+        st.markdown("#### 🛰️ Live Satellite Scene Radiometric Statistics")
+        db_arr = apply_scaling(sar_array, "Decibels (dB)")
+        stats_table = [
+            {"Parameter": "Data Source", "Value": scene_source_title},
+            {"Parameter": "Scene Spatial Dimensions", "Value": f"{sar_array.shape[0]} × {sar_array.shape[1]} pixels"},
+            {"Parameter": "Raw Intensity Range (Linear)", "Value": f"[{sar_array.min():.4f}, {sar_array.max():.4f}]"},
+            {"Parameter": "Mean Radar Intensity (Linear)", "Value": f"{sar_array.mean():.4f} (std={sar_array.std():.4f})"},
+            {"Parameter": "Backscatter Dynamic Range (dB)", "Value": f"[{db_arr.min():.1f} dB, {db_arr.max():.1f} dB]"},
+            {"Parameter": "Mean Backscatter (dB)", "Value": f"{db_arr.mean():.2f} dB"},
+            {"Parameter": "Ocean ROI ENL (Raw SAR)", "Value": f"{raw_enl:.2f}"},
+            {"Parameter": f"Ocean ROI ENL ({mean_name})", "Value": f"{metrics['ENL'][mean_name]:.2f} (+{(metrics['ENL'][mean_name] - raw_enl):.2f})"},
+            {"Parameter": f"Ocean ROI ENL ({gauss_name})", "Value": f"{metrics['ENL'][gauss_name]:.2f} (+{(metrics['ENL'][gauss_name] - raw_enl):.2f})"},
+            {"Parameter": f"Ocean ROI ENL ({lee_name})", "Value": f"{metrics['ENL'][lee_name]:.2f} (+{(metrics['ENL'][lee_name] - raw_enl):.2f})"},
+        ]
+        st.table(stats_table)
 
 with tab4:
     st.markdown("### 🛰️ Real-Time Satellite Provider Architecture & Status")
