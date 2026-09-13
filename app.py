@@ -10,6 +10,7 @@ Run via:
 """
 
 from datetime import datetime, timedelta
+import os
 import numpy as np
 import scipy.ndimage as ndimage
 import matplotlib.pyplot as plt
@@ -117,12 +118,36 @@ else:
     provider_choice = st.sidebar.selectbox(
         "Satellite Data Provider",
         [
-            "Microsoft Planetary Computer STAC (Zero-Auth COG Stream)",
+            "Microsoft Planetary Computer STAC (Free Public COG Stream)",
             "Copernicus Data Space Ecosystem (CDSE OData)",
             "Google Earth Engine (GEE COPERNICUS/S1_GRD)",
         ],
         index=0,
     )
+
+    # Provider connection state & credentials
+    cdse_username = None
+    cdse_password = None
+    gee_project_id = None
+
+    if "Planetary Computer" in provider_choice:
+        st.sidebar.success("🟢 Provider Status: Active (No Login or Keys Required)")
+    elif "Copernicus" in provider_choice:
+        st.sidebar.warning("🟡 CDSE OData Catalogue: Live | Pixel Download: Free Login Required")
+        with st.sidebar.expander("🔐 Optional CDSE Credentials"):
+            cdse_username = st.text_input("Copernicus Email / Username", value=os.environ.get("CDSE_USERNAME", ""))
+            cdse_password = st.text_input("Copernicus Password", type="password", value=os.environ.get("CDSE_PASSWORD", ""))
+            if cdse_username and cdse_password:
+                fetcher_auth = CopernicusCDSEFetcher(cdse_username, cdse_password)
+                if fetcher_auth.authenticate():
+                    st.success("✅ CDSE Token Authenticated!")
+                else:
+                    st.error("❌ CDSE Authentication failed. Check credentials.")
+    elif "Earth Engine" in provider_choice:
+        st.sidebar.warning("🟡 GEE Status: Requires Local Google Cloud Auth")
+        with st.sidebar.expander("🔐 Google Earth Engine Config"):
+            gee_project_id = st.text_input("GCP Project ID", value=os.environ.get("EE_PROJECT_ID", ""))
+            st.caption("Run `earthengine authenticate` in your local terminal to authorize access.")
 
     region_name = st.sidebar.selectbox(
         "Target Marine Region",
@@ -156,11 +181,31 @@ else:
 
     # Cache live streaming to prevent re-querying on every UI click
     @st.cache_data(show_spinner=True)
-    def fetch_live_sar_data(bbox, start_str, end_str, pol):
+    def fetch_live_sar_data(provider_name, bbox, start_str, end_str, pol, cdse_user=None, cdse_pass=None, gee_proj=None):
+        cdse_summary = None
+
+        # If CDSE is selected, query the official ESA OData catalogue
+        if "Copernicus" in provider_name:
+            cdse_fetcher = CopernicusCDSEFetcher(cdse_user, cdse_pass)
+            cdse_products = cdse_fetcher.search_products(bbox, start_str, end_str, max_items=3)
+            if cdse_products:
+                cdse_summary = f"Found {len(cdse_products)} scenes in CDSE OData. Latest: {cdse_products[0]['name']}"
+
+        # If GEE is selected and initialized
+        if "Earth Engine" in provider_name:
+            gee_fetcher = EarthEngineSARFetcher(project_id=gee_proj)
+            ok, msg = gee_fetcher.initialize()
+            if ok:
+                try:
+                    img, meta = gee_fetcher.get_sentinel1_patch(bbox, start_str, end_str, polarization=pol.upper(), patch_size=512)
+                    return img, meta, "GEE Live Composite", "COPERNICUS/S1_GRD", cdse_summary
+                except Exception as e:
+                    st.warning(f"GEE Fetch notice: {e}. Streaming via STAC COG layer.")
+
+        # Default fast public streaming layer: Microsoft Planetary Computer STAC
         fetcher = PlanetaryComputerSARFetcher()
         scenes = fetcher.search_scenes(bbox=bbox, start_date=start_str, end_date=end_str, max_items=5)
         if not scenes:
-            # Fallback search with wider window if recent passes are sparse
             scenes = fetcher.search_scenes(bbox=bbox, start_date="2024-01-01", end_date="2024-03-31", max_items=5)
         if not scenes:
             raise RuntimeError(f"No Sentinel-1 GRD scenes found over bbox {bbox} in date range.")
@@ -172,15 +217,19 @@ else:
             target_shape=(512, 512),
             crop_center=True,
         )
-        return img, meta, target_scene["datetime"], target_scene["id"]
+        return img, meta, target_scene["datetime"], target_scene["id"], cdse_summary
 
     try:
         with st.spinner("Streaming real Sentinel-1 SAR subwindow from orbit via STAC..."):
-            noisy_scene, live_meta, acq_time, scene_id = fetch_live_sar_data(
+            noisy_scene, live_meta, acq_time, scene_id, cdse_info = fetch_live_sar_data(
+                provider_choice,
                 default_bbox,
                 d_start.strftime("%Y-%m-%d"),
                 d_end.strftime("%Y-%m-%d"),
                 pol_code,
+                cdse_username,
+                cdse_password,
+                gee_project_id,
             )
             clean_scene = noisy_scene.copy()  # Ground truth is unknown in real satellite data
             scene_source_title = f"Live Sentinel-1 GRD ({pol_code.upper()}) | {acq_time}"
@@ -193,6 +242,8 @@ else:
             ocean_patch_slice = (slice(20, 140), slice(20, 140))
 
             st.success(f"📡 Ingested Live Sentinel-1 Scene: **{scene_id}** ({acq_time})")
+            if cdse_info:
+                st.info(f"🇪🇺 **Copernicus CDSE OData Feed**: {cdse_info}")
 
     except Exception as e:
         st.error(f"Live fetch error: {e}. Falling back to high-fidelity simulation.")
@@ -383,21 +434,20 @@ with tab3:
     st.table(data_table)
 
 with tab4:
-    st.markdown("### 🛰️ Live Satellite Ingestion Architecture")
+    st.markdown("### 🛰️ Real-Time Satellite Provider Architecture & Status")
+    
     st.markdown("""
-    #### 1. Microsoft Planetary Computer STAC (Currently Active)
-    - **Endpoint**: `https://planetarycomputer.microsoft.com/api/stac/v1`
-    - **Asset Protocol**: HTTP Range Streaming via Cloud-Optimized GeoTIFFs (COGs).
-    - **Advantage**: Zero download delay. Pulls arbitrary $512 \\times 512$ ocean windows from multi-gigabyte orbit strips in $<3$ seconds.
-    - **Authentication**: Pre-signed Shared Access Signatures (SAS) generated on-the-fly without requiring private API tokens.
+    | Provider | Current Operational Status | Authentication Required? | How It Works |
+    |---|---|---|---|
+    | **1. Planetary Computer STAC** | 🟢 **Active & Streaming** | ❌ **No (Free Public Access)** | Uses pre-signed SAS tokens to stream 512×512 subwindows directly out of Sentinel-1 Cloud-Optimized GeoTIFFs via HTTP Range requests in <3 seconds. |
+    | **2. Copernicus CDSE (ESA)** | 🟡 **OData Search Active** | ⚠️ **Yes (Free CDSE Account)** | OData API queries official ESA product catalogue. Downloading full raster products requires entering free CDSE login credentials in the sidebar. |
+    | **3. Google Earth Engine (GEE)** | 🟡 **Client Integrated** | ⚠️ **Yes (Google Cloud Project)** | Integrates `COPERNICUS/S1_GRD` collection. Requires running `earthengine authenticate` or providing a Google Cloud Project ID. |
+    """)
 
-    #### 2. Copernicus Data Space Ecosystem (CDSE)
-    - **OData Catalogue**: `https://catalogue.dataspace.copernicus.eu/odata/v1/Products`
-    - **Coverage**: Full archive of Sentinel-1 Level-1 GRDH and SLC products.
-    - **Authentication**: Set environment variables `CDSE_USERNAME` and `CDSE_PASSWORD` to stream directly from CDSE.
-
-    #### 3. Google Earth Engine (GEE)
-    - **Collection**: `ee.ImageCollection('COPERNICUS/S1_GRD')`
-    - **Calibrated Units**: Radiometrically terrain-corrected $\\sigma^0$ (dB), converted back to linear power: $I = 10^{\\sigma^0 / 10}$.
-    - **Authentication**: Run `earthengine authenticate` in your terminal to initialize Google Cloud Earth Engine credentials.
+    st.markdown("---")
+    st.markdown("""
+    #### Why Planetary Computer is the Active Default:
+    Sentinel-1 orbital strips are huge (typically **$1.0\text{ GB}$ to $1.8\text{ GB}$** per scene). Downloading a full scene from Copernicus CDSE takes 1–3 minutes per query. 
+    
+    In contrast, **Cloud-Optimized GeoTIFFs (COGs)** on Planetary Computer allow reading just the $512 \times 512$ ocean pixels using HTTP range requests in **$<3$ seconds**, making real-time interactive parameter tuning possible in the browser!
     """)
