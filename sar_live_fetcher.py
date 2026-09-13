@@ -18,11 +18,14 @@ Supported Providers:
 from datetime import datetime, timedelta
 import os
 from typing import Dict, List, Optional, Tuple
+from dotenv import load_dotenv
 import numpy as np
 import rasterio
 from rasterio.windows import Window
 import requests
 import scipy.ndimage as ndimage
+
+load_dotenv()
 
 # Curated high-interest marine surveillance corridors
 PRESET_MARINE_REGIONS = {
