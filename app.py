@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import numpy as np
 import scipy.ndimage as ndimage
+from skimage.filters import threshold_otsu
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -131,6 +132,82 @@ def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
     if scale_mode == "Decibels (dB)":
         return 10.0 * np.log10(np.clip(image_array, 1e-5, None))
     return image_array
+
+
+def segment_oil_spill(
+    filtered_sar_array: np.ndarray,
+    use_db: bool = True,
+) -> dict:
+    """
+    Automated dark-spot segmentation using Otsu's thresholding for marine oil
+    spill detection on despeckled SAR imagery.
+
+    The algorithm:
+    1. Extracts valid water pixels (where ~np.isnan), ignoring DEM-masked land.
+    2. Optionally converts to dB scale (10·log10) for better bimodal histogram
+       separation between ocean clutter and damped-surface oil slicks.
+    3. Computes Otsu's optimal binarization threshold on valid water pixels only.
+    4. Classifies: pixel < threshold → Oil (1), pixel >= threshold → Ocean (0).
+    5. Preserves np.nan for land-masked pixels in the output.
+
+    Parameters
+    ----------
+    filtered_sar_array : np.ndarray
+        2D despeckled SAR intensity array (e.g., Adaptive Lee output).
+        May contain np.nan from coastal DEM land masking.
+    use_db : bool, default=True
+        If True, compute Otsu threshold in dB domain for better separation.
+
+    Returns
+    -------
+    dict with keys:
+        'binary_mask'  : np.ndarray of float — 1.0=Oil, 0.0=Ocean, np.nan=Land
+        'threshold_db' : float — Otsu threshold in dB
+        'threshold_lin': float — Otsu threshold in linear power
+        'oil_pixels'   : int   — count of pixels classified as oil
+        'water_pixels' : int   — count of valid (non-land) pixels
+        'oil_pct'      : float — percentage of water area classified as oil
+    """
+    img = np.asarray(filtered_sar_array, dtype=np.float64)
+    nan_mask = np.isnan(img)
+    valid = img[~nan_mask]
+
+    if valid.size < 10:
+        empty = np.full(img.shape, np.nan, dtype=np.float64)
+        return {
+            'binary_mask': empty,
+            'threshold_db': 0.0,
+            'threshold_lin': 0.0,
+            'oil_pixels': 0,
+            'water_pixels': 0,
+            'oil_pct': 0.0,
+        }
+
+    # Convert to dB domain for better bimodal histogram separation
+    valid_db = 10.0 * np.log10(np.clip(valid, 1e-5, None))
+    img_db = np.full_like(img, np.nan)
+    img_db[~nan_mask] = 10.0 * np.log10(np.clip(img[~nan_mask], 1e-5, None))
+
+    # Compute Otsu threshold on valid water pixels only
+    otsu_thresh_db = float(threshold_otsu(valid_db))
+    otsu_thresh_lin = 10.0 ** (otsu_thresh_db / 10.0)
+
+    # Classify: below threshold = Oil (1), above = Ocean (0)
+    binary_mask = np.full(img.shape, np.nan, dtype=np.float64)
+    binary_mask[~nan_mask] = np.where(img_db[~nan_mask] < otsu_thresh_db, 1.0, 0.0)
+
+    oil_count = int(np.nansum(binary_mask == 1.0))
+    water_count = int(np.sum(~nan_mask))
+    oil_pct = (oil_count / water_count * 100.0) if water_count > 0 else 0.0
+
+    return {
+        'binary_mask': binary_mask,
+        'threshold_db': otsu_thresh_db,
+        'threshold_lin': otsu_thresh_lin,
+        'oil_pixels': oil_count,
+        'water_pixels': water_count,
+        'oil_pct': oil_pct,
+    }
 
 
 # ==============================================================================
@@ -413,11 +490,12 @@ with col_m4:
 # VISUALIZATION TABS
 # ==============================================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🖼️ 2x2 Spatial Filter Comparison",
     "📈 1D Radiometric Transect Profile",
     "📋 Quantitative Target Table",
     "🛰️ Satellite API & Provider Details",
+    "🛢️ Path A: Oil Spill Segmentation",
 ])
 
 with tab1:
@@ -621,3 +699,204 @@ with tab4:
     
     In contrast, **Cloud-Optimized GeoTIFFs (COGs)** on Planetary Computer allow reading just the $512 \times 512$ ocean pixels using HTTP range requests in **$<3$ seconds**, making real-time interactive parameter tuning possible in the browser!
     """)
+
+with tab5:
+    st.markdown("### 🛢️ Path A: Automated Dark-Spot Oil Spill Segmentation")
+    st.caption(
+        "Otsu's method computes an optimal binarization threshold by maximizing "
+        "inter-class variance between the ocean clutter and damped-surface oil slick "
+        "intensity distributions. The Adaptive Lee–filtered SAR image is used as input "
+        "to minimize false alarms from residual speckle."
+    )
+
+    # Run segmentation on the Lee-filtered output
+    lee_filtered = filtered_dict[lee_name]
+    seg_result = segment_oil_spill(lee_filtered, use_db=True)
+
+    # --- Metrics Row ---
+    seg_c1, seg_c2, seg_c3, seg_c4 = st.columns(4)
+    with seg_c1:
+        st.metric(
+            "Otsu Threshold",
+            f"{seg_result['threshold_db']:.2f} dB",
+            delta=f"Linear: {seg_result['threshold_lin']:.6f}",
+            delta_color="off",
+        )
+    with seg_c2:
+        st.metric(
+            "Detected Oil Pixels",
+            f"{seg_result['oil_pixels']:,}",
+            delta=f"{seg_result['oil_pct']:.1f}% of water area",
+            delta_color="off",
+        )
+    with seg_c3:
+        st.metric(
+            "Valid Water Pixels",
+            f"{seg_result['water_pixels']:,}",
+        )
+    with seg_c4:
+        land_px = int(np.sum(np.isnan(lee_filtered)))
+        st.metric(
+            "Masked Land Pixels",
+            f"{land_px:,}",
+            delta=f"{(land_px / lee_filtered.size * 100):.1f}% of scene" if land_px > 0 else "0%",
+            delta_color="off",
+        )
+
+    # --- Side-by-side Plot: Lee-Filtered SAR vs Binary Segmentation ---
+    fig_seg, (ax_sar, ax_bin) = plt.subplots(
+        1, 2, figsize=(14, 6), facecolor="#14171A",
+        gridspec_kw={"wspace": 0.08},
+    )
+
+    # LEFT: Lee-filtered SAR in dB with land mask
+    lee_db = apply_scaling(lee_filtered, "Decibels (dB)")
+    valid_lee = lee_db[~np.isnan(lee_db)]
+    if valid_lee.size > 0:
+        vmin_lee = float(np.percentile(valid_lee, 2.0))
+        vmax_lee = float(np.percentile(valid_lee, 99.0))
+    else:
+        vmin_lee, vmax_lee = -30.0, 0.0
+
+    cmap_lee = plt.get_cmap("inferno").copy()
+    cmap_lee.set_bad(color="#080A0C")
+    ax_sar.set_facecolor("#0F1115")
+    im_sar = ax_sar.imshow(
+        lee_db, cmap=cmap_lee, vmin=vmin_lee, vmax=vmax_lee, origin="upper",
+    )
+    ax_sar.set_title(
+        f"Adaptive Lee Filtered ({window_size}×{window_size}) — dB Scale",
+        color="#F5F8FA", fontsize=11, fontweight="bold", pad=10,
+    )
+
+    # Draw Otsu threshold line on colorbar
+    cbar_sar = fig_seg.colorbar(im_sar, ax=ax_sar, fraction=0.046, pad=0.04)
+    cbar_sar.set_label("Backscatter (dB)", color="#E1E8ED", fontsize=9)
+    cbar_sar.ax.tick_params(colors="#8899A6", labelsize=8)
+    if vmin_lee <= seg_result['threshold_db'] <= vmax_lee:
+        cbar_sar.ax.axhline(
+            y=seg_result['threshold_db'], color="#FF3366",
+            linewidth=2.0, linestyle="--",
+        )
+        cbar_sar.ax.text(
+            1.8, seg_result['threshold_db'], f"Otsu\n{seg_result['threshold_db']:.1f} dB",
+            color="#FF3366", fontsize=8, fontweight="bold",
+            va="center", transform=cbar_sar.ax.get_yaxis_transform(),
+        )
+
+    ax_sar.tick_params(colors="#8899A6", labelsize=8)
+    for s in ax_sar.spines.values():
+        s.set_edgecolor("#38444D")
+
+    # RIGHT: Binary segmentation mask
+    # Custom colormap: 0=Ocean (deep blue), 1=Oil (bright yellow), NaN=Land (black)
+    from matplotlib.colors import ListedColormap
+    spill_cmap = ListedColormap(["#0A1628", "#FFD700"])
+    spill_cmap.set_bad(color="#080A0C")
+
+    ax_bin.set_facecolor("#0F1115")
+    im_bin = ax_bin.imshow(
+        seg_result['binary_mask'], cmap=spill_cmap, vmin=0, vmax=1,
+        origin="upper", interpolation="nearest",
+    )
+    ax_bin.set_title(
+        "Otsu Binary Segmentation (Oil = Yellow, Ocean = Blue)",
+        color="#F5F8FA", fontsize=11, fontweight="bold", pad=10,
+    )
+
+    # Legend patch
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#0A1628", edgecolor="#38444D", label="Ocean (Clean)"),
+        Patch(facecolor="#FFD700", edgecolor="#38444D", label="Oil Spill (Detected)"),
+        Patch(facecolor="#080A0C", edgecolor="#38444D", label="Land (DEM Masked)"),
+    ]
+    ax_bin.legend(
+        handles=legend_elements, loc="lower right",
+        facecolor="#1F242D", edgecolor="#38444D", labelcolor="#E1E8ED",
+        fontsize=8.5, framealpha=0.9,
+    )
+
+    # Badge with threshold and oil area
+    badge_text = (
+        f"Otsu: {seg_result['threshold_db']:.1f} dB\n"
+        f"Oil Area: {seg_result['oil_pct']:.1f}%"
+    )
+    ax_bin.text(
+        0.03, 0.96, badge_text,
+        transform=ax_bin.transAxes, color="#FFFFFF", fontsize=9.5,
+        fontweight="bold", va="top", ha="left",
+        bbox=dict(
+            boxstyle="round,pad=0.35", facecolor="#1F242D",
+            edgecolor="#FFD700", linewidth=1.5, alpha=0.92,
+        ),
+    )
+
+    ax_bin.tick_params(colors="#8899A6", labelsize=8)
+    for s in ax_bin.spines.values():
+        s.set_edgecolor("#38444D")
+
+    plt.subplots_adjust(left=0.04, right=0.92, top=0.92, bottom=0.06)
+    st.pyplot(fig_seg, clear_figure=True)
+
+    # --- Histogram: Water pixel dB distribution with Otsu threshold line ---
+    st.markdown("#### 📊 Water Pixel Intensity Distribution & Otsu Decision Boundary")
+    if valid_lee.size > 20:
+        fig_hist, ax_hist = plt.subplots(figsize=(10, 4), facecolor="#14171A")
+        ax_hist.set_facecolor("#0F1115")
+
+        counts, bin_edges, bar_patches = ax_hist.hist(
+            valid_lee, bins=128, color="#1E88E5", alpha=0.85,
+            edgecolor="#0D47A1", linewidth=0.4,
+        )
+
+        # Color bins below Otsu threshold in yellow (oil side)
+        for patch, left_edge in zip(bar_patches, bin_edges[:-1]):
+            if left_edge < seg_result['threshold_db']:
+                patch.set_facecolor("#FFD700")
+                patch.set_edgecolor("#F9A825")
+
+        ax_hist.axvline(
+            seg_result['threshold_db'], color="#FF3366", linewidth=2.5,
+            linestyle="--", label=f"Otsu Threshold = {seg_result['threshold_db']:.2f} dB",
+        )
+        ax_hist.fill_betweenx(
+            [0, counts.max() * 1.05],
+            vmin_lee, seg_result['threshold_db'],
+            alpha=0.08, color="#FFD700",
+        )
+        ax_hist.fill_betweenx(
+            [0, counts.max() * 1.05],
+            seg_result['threshold_db'], vmax_lee,
+            alpha=0.06, color="#1E88E5",
+        )
+
+        ax_hist.text(
+            seg_result['threshold_db'] - 1.5, counts.max() * 0.85,
+            "← Oil Spill", color="#FFD700", fontsize=10, fontweight="bold",
+            ha="right",
+        )
+        ax_hist.text(
+            seg_result['threshold_db'] + 1.5, counts.max() * 0.85,
+            "Ocean →", color="#64B5F6", fontsize=10, fontweight="bold",
+            ha="left",
+        )
+
+        ax_hist.set_xlabel("Backscatter Intensity (dB)", color="#E1E8ED", fontsize=10)
+        ax_hist.set_ylabel("Pixel Count", color="#E1E8ED", fontsize=10)
+        ax_hist.set_title(
+            "Bimodal Histogram of Lee-Filtered Water Pixels (dB Domain)",
+            color="#F5F8FA", fontsize=12, fontweight="bold",
+        )
+        ax_hist.legend(
+            facecolor="#1F242D", edgecolor="#FF3366",
+            labelcolor="#E1E8ED", fontsize=9.5,
+        )
+        ax_hist.tick_params(colors="#8899A6", labelsize=9)
+        for s in ax_hist.spines.values():
+            s.set_edgecolor("#38444D")
+
+        plt.tight_layout()
+        st.pyplot(fig_hist, clear_figure=True)
+    else:
+        st.warning("Insufficient valid water pixels for histogram rendering.")
