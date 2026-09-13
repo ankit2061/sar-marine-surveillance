@@ -13,7 +13,60 @@ from datetime import datetime, timedelta, timezone
 import os
 import numpy as np
 import scipy.ndimage as ndimage
-# scikit-image threshold_otsu removed — replaced by statistical anomaly threshold (μ − k·σ)
+
+def morphological_cleanup(
+    binary_mask: np.ndarray,
+    closing_radius: int = 5,
+    opening_radius: int = 2,
+) -> np.ndarray:
+    """
+    Morphological post-processing for oil spill binary masks.
+
+    1. Binary Closing (dilation then erosion) with a circular footprint of
+       `closing_radius` to bridge fragmented slick pixels broken by ocean
+       currents and wind shear into solid connected polygons.
+    2. Binary Opening (erosion then dilation) with a smaller circular footprint
+       of `opening_radius` to strip away isolated 1–2 pixel false-positive
+       specks in the open ocean.
+    3. Re-applies the original np.nan land mask so morphological kernels never
+       bleed oil classifications onto coastal landmasses.
+
+    Parameters
+    ----------
+    binary_mask : np.ndarray
+        2D float array: 1.0=Oil, 0.0=Ocean, np.nan=Land.
+    closing_radius : int
+        Radius of the circular structuring element for closing.
+    opening_radius : int
+        Radius of the circular structuring element for opening.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Morphologically cleaned binary mask with NaN land preserved.
+    """
+    nan_mask = np.isnan(binary_mask)
+    # Work on a clean boolean copy (land treated as 0 during morphology)
+    bool_mask = np.where(nan_mask, False, binary_mask == 1.0)
+
+    # Build circular structuring elements using scipy-compatible meshgrid
+    def _disk(radius):
+        y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        return (x ** 2 + y ** 2) <= radius ** 2
+
+    # Step 1: Close — bridge fragmented slick segments
+    if closing_radius > 0:
+        struct_close = _disk(closing_radius)
+        bool_mask = ndimage.binary_closing(bool_mask, structure=struct_close)
+
+    # Step 2: Open — remove isolated false-positive specks
+    if opening_radius > 0:
+        struct_open = _disk(opening_radius)
+        bool_mask = ndimage.binary_opening(bool_mask, structure=struct_open)
+
+    # Re-apply NaN land mask strictly
+    cleaned = np.where(nan_mask, np.nan, bool_mask.astype(np.float64))
+    return cleaned
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -741,9 +794,54 @@ with tab5:
         ),
     )
 
+    # Morphological cleanup controls
+    st.markdown("---")
+    morph_cols = st.columns([1, 1, 1])
+    with morph_cols[0]:
+        enable_morphology = st.checkbox(
+            "Enable Morphological Cleanup",
+            value=True,
+            help="Apply binary closing + opening to consolidate fragmented slick pixels into solid polygons and remove isolated false-positive specks.",
+        )
+    with morph_cols[1]:
+        closing_r = st.slider(
+            "Closing Radius (bridge gaps)",
+            min_value=1, max_value=10, value=5, step=1,
+            disabled=not enable_morphology,
+            help="Circular structuring element radius for binary closing. Larger values bridge wider gaps between fragmented oil patches.",
+        )
+    with morph_cols[2]:
+        opening_r = st.slider(
+            "Opening Radius (remove specks)",
+            min_value=1, max_value=6, value=2, step=1,
+            disabled=not enable_morphology,
+            help="Circular structuring element radius for binary opening. Strips away isolated false-positive pixels smaller than this radius.",
+        )
+
     # Run segmentation on the Lee-filtered output
     lee_filtered = filtered_dict[lee_name]
     seg_result = segment_oil_spill_statistical(lee_filtered, std_dev_multiplier=std_dev_k)
+
+    # Apply morphological cleanup if enabled
+    if enable_morphology:
+        raw_oil = seg_result['oil_pixels']
+        seg_result['binary_mask'] = morphological_cleanup(
+            seg_result['binary_mask'],
+            closing_radius=closing_r,
+            opening_radius=opening_r,
+        )
+        # Recompute oil pixel stats after cleanup
+        cleaned_mask = seg_result['binary_mask']
+        seg_result['oil_pixels'] = int(np.nansum(cleaned_mask == 1.0))
+        seg_result['water_pixels'] = int(np.sum(~np.isnan(cleaned_mask)))
+        seg_result['oil_pct'] = (
+            (seg_result['oil_pixels'] / seg_result['water_pixels'] * 100.0)
+            if seg_result['water_pixels'] > 0 else 0.0
+        )
+        morph_delta = seg_result['oil_pixels'] - raw_oil
+        morph_label = f"Δ = {morph_delta:+,} px after morphology"
+    else:
+        morph_label = None
 
     # --- Metrics Row ---
     seg_c1, seg_c2, seg_c3, seg_c4 = st.columns(4)
@@ -755,10 +853,11 @@ with tab5:
             delta_color="off",
         )
     with seg_c2:
+        oil_delta_text = morph_label if morph_label else f"{seg_result['oil_pct']:.1f}% of water area"
         st.metric(
             "Detected Oil Pixels",
             f"{seg_result['oil_pixels']:,}",
-            delta=f"{seg_result['oil_pct']:.1f}% of water area",
+            delta=oil_delta_text,
             delta_color="off",
         )
     with seg_c3:
