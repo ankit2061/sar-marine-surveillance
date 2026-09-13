@@ -32,6 +32,7 @@ from sar_live_fetcher import (
     EarthEngineSARFetcher,
     PRESET_MARINE_REGIONS,
     find_bright_targets,
+    fetch_copernicus_dem_land_mask,
 )
 
 st.set_page_config(
@@ -91,6 +92,25 @@ contrast_percentile = st.sidebar.slider(
     value=99.2,
     step=0.1,
 )
+
+# DEM Land Masking
+st.sidebar.markdown("### 🏝️ Coastal Land Masking")
+enable_land_mask = st.sidebar.checkbox(
+    "Enable Copernicus DEM 30m Land Mask",
+    value=True,
+    help="Queries Copernicus DEM 30m (cop-dem-glo-30) to mask coastal landmasses and infrastructure as NaN prior to filtering.",
+)
+dem_elev_threshold = 0.0
+if enable_land_mask:
+    dem_elev_threshold = st.sidebar.slider(
+        "Land Elevation Threshold (m)",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.5,
+        step=0.5,
+        help="Pixels with elevation above this threshold are classified as Land and set to NaN. Use 0.5-2.0m for tidal margins.",
+    )
+
 
 def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
     """
@@ -320,6 +340,28 @@ if sar_array is None:
     st.warning("No SAR array loaded. Please select an input source.")
     st.stop()
 
+# --- COPERNICUS DEM LAND MASKING ---
+land_mask = None
+if enable_land_mask and not is_synthetic:
+    with st.spinner("Fetching Copernicus DEM 30m & masking coastal landmasses..."):
+        try:
+            land_mask, dem_elev = fetch_copernicus_dem_land_mask(
+                bbox=default_bbox,
+                target_shape=sar_array.shape,
+                elevation_threshold=dem_elev_threshold,
+            )
+            land_count = int(np.sum(land_mask))
+            land_pct = (land_count / sar_array.size) * 100.0
+            if land_count > 0:
+                # Apply mask: set all Land pixels to np.nan
+                sar_array = np.where(land_mask, np.nan, sar_array)
+                clean_scene = sar_array.copy()
+                st.info(f"🏝️ **Copernicus DEM Land Mask Applied**: Masked {land_count:,} land pixels ({land_pct:.1f}% of scene at >{dem_elev_threshold:.1f}m elevation).")
+            else:
+                st.caption("ℹ️ Copernicus DEM indicates 100% open water (no land detected).")
+        except Exception as e:
+            st.warning(f"DEM Land Masking notice: {e}. Continuing with unmasked SAR.")
+
 # ==============================================================================
 # FILTER EXECUTION & METRIC CALCULATION
 # ==============================================================================
@@ -398,17 +440,25 @@ with tab1:
     roi_x, roi_y = x_slice.start, y_slice.start
     roi_w, roi_h = x_slice.stop - x_slice.start, y_slice.stop - y_slice.start
 
-    # Dynamic display range based on linear or logarithmic (dB) scale
-    if scale_mode == "Decibels (dB)":
-        v_min = float(np.percentile(scaled_raw, 2.0))
-        v_max = float(np.percentile(scaled_raw, contrast_percentile))
+    # Dynamic display range based on linear or logarithmic (dB) scale (ignoring NaNs)
+    valid_pixels = scaled_raw[~np.isnan(scaled_raw)]
+    if valid_pixels.size > 0:
+        if scale_mode == "Decibels (dB)":
+            v_min = float(np.percentile(valid_pixels, 2.0))
+            v_max = float(np.percentile(valid_pixels, contrast_percentile))
+        else:
+            v_min = float(np.percentile(valid_pixels, 1.0))
+            v_max = float(np.percentile(valid_pixels, contrast_percentile))
     else:
-        v_min = float(np.percentile(scaled_raw, 1.0))
-        v_max = float(np.percentile(scaled_raw, contrast_percentile))
+        v_min, v_max = 0.0, 1.0
+
+    # Configure colormap with dark masked land color for NaNs
+    cmap_obj = plt.get_cmap(colormap).copy()
+    cmap_obj.set_bad(color="#101418")
 
     for title, img, ax, enl_val in plot_configs:
         ax.set_facecolor("#0F1115")
-        im = ax.imshow(img, cmap=colormap, vmin=v_min, vmax=v_max, origin="upper")
+        im = ax.imshow(img, cmap=cmap_obj, vmin=v_min, vmax=v_max, origin="upper")
         ax.set_title(title, color="#F5F8FA", fontsize=12, fontweight="bold", pad=10)
 
         # Highlight Ocean ENL ROI
@@ -537,13 +587,15 @@ with tab3:
     else:
         st.markdown("#### 🛰️ Live Satellite Scene Radiometric Statistics")
         db_arr = apply_scaling(sar_array, "Decibels (dB)")
+        land_info = f"{int(np.sum(np.isnan(sar_array))):,} pixels ({(np.sum(np.isnan(sar_array))/sar_array.size)*100:.1f}%)" if np.any(np.isnan(sar_array)) else "0 pixels (100% water)"
         stats_table = [
             {"Parameter": "Data Source", "Value": scene_source_title},
             {"Parameter": "Scene Spatial Dimensions", "Value": f"{sar_array.shape[0]} × {sar_array.shape[1]} pixels"},
-            {"Parameter": "Raw Intensity Range (Linear)", "Value": f"[{sar_array.min():.4f}, {sar_array.max():.4f}]"},
-            {"Parameter": "Mean Radar Intensity (Linear)", "Value": f"{sar_array.mean():.4f} (std={sar_array.std():.4f})"},
-            {"Parameter": "Backscatter Dynamic Range (dB)", "Value": f"[{db_arr.min():.1f} dB, {db_arr.max():.1f} dB]"},
-            {"Parameter": "Mean Backscatter (dB)", "Value": f"{db_arr.mean():.2f} dB"},
+            {"Parameter": "Copernicus DEM Masked Land", "Value": land_info},
+            {"Parameter": "Water Intensity Range (Linear)", "Value": f"[{np.nanmin(sar_array):.4f}, {np.nanmax(sar_array):.4f}]"},
+            {"Parameter": "Mean Water Radar Intensity", "Value": f"{np.nanmean(sar_array):.4f} (std={np.nanstd(sar_array):.4f})"},
+            {"Parameter": "Water Backscatter Dynamic Range (dB)", "Value": f"[{np.nanmin(db_arr):.1f} dB, {np.nanmax(db_arr):.1f} dB]"},
+            {"Parameter": "Mean Water Backscatter (dB)", "Value": f"{np.nanmean(db_arr):.2f} dB"},
             {"Parameter": "Ocean ROI ENL (Raw SAR)", "Value": f"{raw_enl:.2f}"},
             {"Parameter": f"Ocean ROI ENL ({mean_name})", "Value": f"{metrics['ENL'][mean_name]:.2f} (+{(metrics['ENL'][mean_name] - raw_enl):.2f})"},
             {"Parameter": f"Ocean ROI ENL ({gauss_name})", "Value": f"{metrics['ENL'][gauss_name]:.2f} (+{(metrics['ENL'][gauss_name] - raw_enl):.2f})"},

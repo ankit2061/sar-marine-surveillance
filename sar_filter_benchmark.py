@@ -159,38 +159,75 @@ def generate_synthetic_sar_scene(
 # 2. FILTER IMPLEMENTATIONS
 # ==============================================================================
 
+# ==============================================================================
+
 def mean_filter(image: np.ndarray, window_size: int = 5) -> np.ndarray:
     """
-    Standard spatial box (uniform mean) filter.
-    Convolution with an N x N kernel of uniform weights 1 / N^2.
+    Standard spatial box (uniform mean) filter with NaN-safe normalized convolution.
+    Only computes moving averages over valid (water) pixels, preventing land mask
+    NaN values from bleeding across coastal boundaries into ocean clutter.
 
     Parameters
     ----------
     image : np.ndarray
-        Input SAR intensity image.
+        Input SAR intensity image (may contain np.nan for masked land).
     window_size : int
         Size of sliding window (default: 5).
     """
-    return ndimage.uniform_filter(image.astype(np.float64), size=window_size, mode="reflect")
+    img = np.asarray(image, dtype=np.float64)
+    nan_mask = np.isnan(img)
+    if not np.any(nan_mask):
+        return ndimage.uniform_filter(img, size=window_size, mode="reflect")
+
+    # Normalized convolution ignoring NaNs
+    clean_img = np.where(nan_mask, 0.0, img)
+    valid_weights = np.where(nan_mask, 0.0, 1.0)
+
+    sum_vals = ndimage.uniform_filter(clean_img, size=window_size, mode="constant", cval=0.0)
+    sum_weights = ndimage.uniform_filter(valid_weights, size=window_size, mode="constant", cval=0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        filtered = np.where(sum_weights > 0, sum_vals / sum_weights, np.nan)
+
+    filtered[nan_mask] = np.nan
+    return filtered
 
 
 def gaussian_filter(image: np.ndarray, sigma: float = 1.2) -> np.ndarray:
     """
-    Standard isotropic Gaussian low-pass spatial filter.
+    Standard isotropic Gaussian spatial filter with NaN-safe normalized convolution.
+    Normalizes by the sum of Gaussian kernel weights over valid water pixels,
+    preventing coastal edge corruption.
 
     Parameters
     ----------
     image : np.ndarray
-        Input SAR intensity image.
+        Input SAR intensity image (may contain np.nan for masked land).
     sigma : float
         Standard deviation of Gaussian kernel.
     """
-    return ndimage.gaussian_filter(image.astype(np.float64), sigma=sigma, mode="reflect")
+    img = np.asarray(image, dtype=np.float64)
+    nan_mask = np.isnan(img)
+    if not np.any(nan_mask):
+        return ndimage.gaussian_filter(img, sigma=sigma, mode="reflect")
+
+    clean_img = np.where(nan_mask, 0.0, img)
+    valid_weights = np.where(nan_mask, 0.0, 1.0)
+
+    sum_vals = ndimage.gaussian_filter(clean_img, sigma=sigma, mode="constant", cval=0.0)
+    sum_weights = ndimage.gaussian_filter(valid_weights, sigma=sigma, mode="constant", cval=0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        filtered = np.where(sum_weights > 0, sum_vals / sum_weights, np.nan)
+
+    filtered[nan_mask] = np.nan
+    return filtered
 
 
 def lee_filter(image: np.ndarray, window_size: int = 5, n_looks: int = 4) -> np.ndarray:
     """
-    Adaptive Lee Filter for Multiplicative SAR Speckle Noise (Lee, 1980).
+    Adaptive Lee Filter for Multiplicative SAR Speckle Noise (Lee, 1980)
+    with NaN-safe local moment estimation.
 
     Mathematical Formulation:
     -------------------------
@@ -199,9 +236,9 @@ def lee_filter(image: np.ndarray, window_size: int = 5, n_looks: int = 4) -> np.
         where R is true radar reflectivity, and v is multiplicative speckle with:
         E[v] = 1.0,  Var[v] = sigma_v^2 = 1.0 / n_looks
 
-    Local Window Statistics:
-        Local Mean:     mu_I = <I>
-        Local Variance: var_I = <I^2> - mu_I^2
+    Local Window Statistics (over valid water pixels):
+        Local Mean:     mu_I = <I>_valid
+        Local Variance: var_I = <I^2>_valid - mu_I^2
 
     Theoretical Speckle Variance:
         speckle_var = mu_I^2 * sigma_v^2
@@ -212,14 +249,10 @@ def lee_filter(image: np.ndarray, window_size: int = 5, n_looks: int = 4) -> np.
     MMSE Linear Estimate:
         R_hat = mu_I + W * (I - mu_I)
 
-    Adaptive Duality:
-    - Homogeneous clutter: var_I ~ speckle_var  ==>  W -> 0  ==>  R_hat = mu_I (Box smoothing).
-    - Point target or edge: var_I >> speckle_var ==>  W -> 1  ==>  R_hat = I (Preserves sharp target).
-
     Parameters
     ----------
     image : np.ndarray
-        Input SAR intensity image.
+        Input SAR intensity image (may contain np.nan for masked land).
     window_size : int
         Sliding window size (must be odd, e.g., 5x5 or 7x7).
     n_looks : int
@@ -228,27 +261,46 @@ def lee_filter(image: np.ndarray, window_size: int = 5, n_looks: int = 4) -> np.
     Returns
     -------
     filtered : np.ndarray
-        Adaptive Lee filtered intensity image.
+        Adaptive Lee filtered intensity image with land NaNs preserved.
     """
     img = np.asarray(image, dtype=np.float64)
+    nan_mask = np.isnan(img)
     sigma_v_sq = 1.0 / float(n_looks)
 
-    # 1. Compute local moments via 2D moving uniform average
-    local_mean = ndimage.uniform_filter(img, size=window_size, mode="reflect")
-    local_sq_mean = ndimage.uniform_filter(img ** 2, size=window_size, mode="reflect")
-    local_var = np.maximum(0.0, local_sq_mean - local_mean ** 2)
+    if not np.any(nan_mask):
+        local_mean = ndimage.uniform_filter(img, size=window_size, mode="reflect")
+        local_sq_mean = ndimage.uniform_filter(img ** 2, size=window_size, mode="reflect")
+        local_var = np.maximum(0.0, local_sq_mean - local_mean ** 2)
+        speckle_var_comp = (local_mean ** 2) * sigma_v_sq
+        diff = local_var - speckle_var_comp
+        weight = np.where(local_var > 1e-12, diff / local_var, 0.0)
+        weight = np.clip(weight, 0.0, 1.0)
+        filtered = local_mean + weight * (img - local_mean)
+        return np.maximum(0.0, filtered)
 
-    # 2. Expected speckle variance component in the current window
-    speckle_var_component = (local_mean ** 2) * sigma_v_sq
+    # NaN-safe local moment calculation
+    clean_img = np.where(nan_mask, 0.0, img)
+    clean_sq = np.where(nan_mask, 0.0, img ** 2)
+    valid_weights = np.where(nan_mask, 0.0, 1.0)
 
-    # 3. Calculate Lee Weighting factor W with numerical safety
-    diff = local_var - speckle_var_component
-    weight = np.where(local_var > 1e-12, diff / local_var, 0.0)
-    weight = np.clip(weight, 0.0, 1.0)
+    sum_weights = ndimage.uniform_filter(valid_weights, size=window_size, mode="constant", cval=0.0)
+    sum_vals = ndimage.uniform_filter(clean_img, size=window_size, mode="constant", cval=0.0)
+    sum_sq = ndimage.uniform_filter(clean_sq, size=window_size, mode="constant", cval=0.0)
 
-    # 4. Adaptive interpolation
-    filtered = local_mean + weight * (img - local_mean)
-    return np.maximum(0.0, filtered)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        local_mean = np.where(sum_weights > 0, sum_vals / sum_weights, np.nan)
+        local_sq_mean = np.where(sum_weights > 0, sum_sq / sum_weights, np.nan)
+        local_var = np.maximum(0.0, local_sq_mean - local_mean ** 2)
+
+        speckle_var_comp = (local_mean ** 2) * sigma_v_sq
+        diff = local_var - speckle_var_comp
+        weight = np.where(local_var > 1e-12, diff / local_var, 0.0)
+        weight = np.clip(weight, 0.0, 1.0)
+
+        filtered = local_mean + weight * (img - local_mean)
+
+    filtered[nan_mask] = np.nan
+    return np.where(np.isnan(filtered), np.nan, np.maximum(0.0, filtered))
 
 
 # ==============================================================================
@@ -260,14 +312,14 @@ def calculate_enl(image_patch: np.ndarray) -> float:
     Calculates the Equivalent Number of Looks (ENL) over a homogeneous region:
         ENL = (mean)^2 / variance
 
-    Interpretation:
-    - Higher ENL represents superior speckle suppression and radiometric resolution.
-    - Raw L-look SAR has theoretical ENL ~ L.
-    - An N x N box filter over independent samples yields ENL ~ N^2 * L.
+    NaN-safe: ignores any masked land pixels within the patch.
     """
     patch = np.asarray(image_patch, dtype=np.float64)
-    mean_val = np.mean(patch)
-    var_val = np.var(patch, ddof=1)
+    valid_patch = patch[~np.isnan(patch)]
+    if valid_patch.size < 4:
+        return 0.0
+    mean_val = np.mean(valid_patch)
+    var_val = np.var(valid_patch, ddof=1)
     if var_val < 1e-12:
         return np.inf
     return float((mean_val ** 2) / var_val)

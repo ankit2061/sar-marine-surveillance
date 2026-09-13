@@ -432,3 +432,94 @@ def find_bright_targets(intensity_image: np.ndarray, threshold_factor: float = 4
     # Sort by descending intensity
     peak_coords.sort(key=lambda coord: intensity_image[coord], reverse=True)
     return peak_coords[:8]
+
+
+# ==============================================================================
+# 5. COPERNICUS DEM (30M) LAND MASKING MODULE
+# ==============================================================================
+
+def fetch_copernicus_dem_land_mask(
+    bbox: List[float],
+    target_shape: Tuple[int, int] = (512, 512),
+    elevation_threshold: float = 0.0,
+    target_crs: str = "EPSG:4326",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Queries Microsoft Planetary Computer STAC for Copernicus DEM GLO-30
+    (cop-dem-glo-30), reprojects and resamples it to match the SAR scene array,
+    and returns a binary land mask where elevation > elevation_threshold.
+
+    Parameters
+    ----------
+    bbox : list of float
+        Bounding box [min_lon, min_lat, max_lon, max_lat] matching the SAR scene.
+    target_shape : tuple of int, default=(512, 512)
+        Output array shape (height, width) matching the SAR array.
+    elevation_threshold : float, default=0.0
+        Threshold in meters above which pixels are categorized as Land (> threshold).
+        Use 0.0 for standard shoreline or ~2.0m for intertidal/reef margin safety.
+    target_crs : str, default='EPSG:4326'
+        Coordinate Reference System.
+
+    Returns
+    -------
+    land_mask : np.ndarray of bool
+        Boolean 2D array of shape `target_shape`. True = Land, False = Water.
+    dem_aligned : np.ndarray of float32
+        Reprojected elevation raster in meters.
+    """
+    import pystac_client
+    import planetary_computer
+    from rasterio.warp import reproject, Resampling
+    from rasterio.transform import from_bounds
+    import time
+
+    stac_endpoint = "https://planetarycomputer.microsoft.com/api/stac/v1"
+    client = None
+    for attempt in range(3):
+        try:
+            client = pystac_client.Client.open(stac_endpoint, modifier=planetary_computer.sign_inplace)
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.5)
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    search = client.search(
+        collections=["cop-dem-glo-30"],
+        bbox=bbox,
+        max_items=8,
+    )
+    items = list(search.items())
+
+    height, width = target_shape
+    dst_transform = from_bounds(min_lon, min_lat, max_lon, max_lat, width, height)
+    dem_aligned = np.full(target_shape, np.nan, dtype=np.float32)
+
+    if not items:
+        # If no DEM tiles exist (e.g. open ocean far from coast), return all water
+        return np.zeros(target_shape, dtype=bool), np.zeros(target_shape, dtype=np.float32)
+
+    for item in items:
+        asset_href = item.assets["data"].href
+        with rasterio.open(asset_href) as dem_src:
+            tile_buf = np.full(target_shape, np.nan, dtype=np.float32)
+            reproject(
+                source=rasterio.band(dem_src, 1),
+                destination=tile_buf,
+                src_transform=dem_src.transform,
+                src_crs=dem_src.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=dem_src.nodata,
+                dst_nodata=np.nan,
+            )
+            valid = ~np.isnan(tile_buf)
+            dem_aligned[valid] = tile_buf[valid]
+
+    # Fill any unassigned ocean nodata pixels with 0.0m elevation
+    dem_aligned = np.nan_to_num(dem_aligned, nan=0.0)
+    land_mask = dem_aligned > float(elevation_threshold)
+    return land_mask, dem_aligned
