@@ -281,6 +281,100 @@ def segment_oil_spill_statistical(
     }
 
 
+def detect_vessels_cfar(
+    linear_sar_array: np.ndarray,
+    guard_size: int = 5,
+    bg_size: int = 15,
+    threshold_multiplier: float = 5.0,
+) -> np.ndarray:
+    """
+    2D Cell-Averaging Constant False Alarm Rate (CA-CFAR) vessel detector
+    for SAR imagery operating strictly in the Linear Power domain.
+
+    The CA-CFAR algorithm adaptively estimates the local ocean clutter level
+    using a sliding annular window around each Cell Under Test (CUT):
+      - Guard Window (guard_size × guard_size): isolates target energy and sidelobes
+        from leaking into the clutter background estimation.
+      - Background Window (bg_size × bg_size): training cells between the guard and
+        outer boundary used to estimate local clutter mean and standard deviation.
+      - Adaptive Threshold: T = μ_bg + (threshold_multiplier × σ_bg).
+      - Condition: If CUT intensity > T, flag as vessel (1.0).
+
+    CRITICAL REQUIREMENTS:
+      1. Operates on Linear Power (NOT Decibels).
+      2. NaN-Safe: Background cells containing np.nan (coastal DEM land mask)
+         are strictly excluded from the clutter mean and std calculations.
+      3. Preserves np.nan for land pixels in the returned binary mask.
+
+    Parameters
+    ----------
+    linear_sar_array : np.ndarray
+        2D SAR backscatter intensity array in linear power (e.g., Gaussian filter output).
+        May contain np.nan from coastal DEM land masking.
+    guard_size : int, default=5
+        Size (in pixels) of the inner guard window centered at the CUT.
+    bg_size : int, default=15
+        Size (in pixels) of the outer background clutter window. Must be > guard_size.
+    threshold_multiplier : float, default=5.0
+        Tuning multiplier (k) determining the CFAR detection threshold:
+        T = μ_bg + k · σ_bg.
+
+    Returns
+    -------
+    binary_mask : np.ndarray
+        2D float array where 1.0 = Vessel, 0.0 = Ocean / Water, and np.nan = Land.
+    """
+    img = np.asarray(linear_sar_array, dtype=np.float64)
+
+    # Enforce odd window sizes and ensure bg_size > guard_size
+    guard_size = max(1, int(guard_size))
+    bg_size = max(guard_size + 2, int(bg_size))
+    if guard_size % 2 == 0:
+        guard_size += 1
+    if bg_size % 2 == 0:
+        bg_size += 1
+
+    nan_mask = np.isnan(img)
+    valid_mask = (~nan_mask).astype(np.float64)
+    # Exclude land (NaN) pixels from clutter calculations
+    clean_img = np.where(nan_mask, 0.0, np.clip(img, 0.0, None))
+    clean_sq = clean_img ** 2
+
+    # Construct annular clutter kernel (Background box with Guard box zeroed out)
+    k_bg = np.ones((bg_size, bg_size), dtype=np.float64)
+    pad = (bg_size - guard_size) // 2
+    k_bg[pad:pad + guard_size, pad:pad + guard_size] = 0.0
+
+    # 2D Fast Normalized Convolution excluding NaNs
+    sum_bg = ndimage.convolve(clean_img, k_bg, mode="constant", cval=0.0)
+    sum_sq_bg = ndimage.convolve(clean_sq, k_bg, mode="constant", cval=0.0)
+    count_bg = ndimage.convolve(valid_mask, k_bg, mode="constant", cval=0.0)
+
+    # Valid background condition: requires at least 1 valid ocean pixel in window
+    valid_bg = count_bg > 0
+    mean_bg = np.zeros_like(img)
+    mean_bg[valid_bg] = sum_bg[valid_bg] / count_bg[valid_bg]
+
+    var_bg = np.zeros_like(img)
+    var_bg[valid_bg] = np.maximum(
+        0.0, (sum_sq_bg[valid_bg] / count_bg[valid_bg]) - (mean_bg[valid_bg] ** 2)
+    )
+    std_bg = np.sqrt(var_bg)
+
+    # Adaptive CA-CFAR threshold in Linear Power
+    thresh = mean_bg + (threshold_multiplier * std_bg)
+
+    # Generate binary mask: 1.0 = Vessel, 0.0 = Ocean, np.nan = Land
+    binary_mask = np.full(img.shape, np.nan, dtype=np.float64)
+    water_mask = ~nan_mask
+    binary_mask[water_mask] = 0.0
+    detected = water_mask & valid_bg & (img > thresh)
+    binary_mask[detected] = 1.0
+
+    return binary_mask
+
+
+
 # ==============================================================================
 # DATA LOADING BASED ON SELECTED MODE
 # ==============================================================================
@@ -561,12 +655,13 @@ with col_m4:
 # VISUALIZATION TABS
 # ==============================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🖼️ 2x2 Spatial Filter Comparison",
     "📈 1D Radiometric Transect Profile",
     "📋 Quantitative Target Table",
     "🛰️ Satellite API & Provider Details",
     "🛢️ Path A: Oil Spill Segmentation",
+    "🚢 Path B: CFAR Vessel Detection",
 ])
 
 with tab1:
@@ -1038,3 +1133,241 @@ with tab5:
         st.pyplot(fig_hist, clear_figure=True)
     else:
         st.warning("Insufficient valid water pixels for histogram rendering.")
+
+with tab6:
+    st.markdown("### 🚢 Path B: 2D CA-CFAR Automated Vessel Detection")
+    st.caption(
+        "2D Cell-Averaging Constant False Alarm Rate (CA-CFAR) detector operating in the "
+        "**Linear Power domain**. An annular clutter window estimates local ocean background "
+        "statistics (mean $\\mu_{bg}$ and standard deviation $\\sigma_{bg}$), excluding guard cells "
+        "and landmasses, flagging bright specular point targets where $I_{CUT} > \\mu_{bg} + k\\cdot\\sigma_{bg}$."
+    )
+
+    # --- CFAR Parameter Sliders ---
+    cfar_col1, cfar_col2, cfar_col3 = st.columns(3)
+    with cfar_col1:
+        cfar_guard_size = st.slider(
+            "Guard Window Size (px)",
+            min_value=1,
+            max_value=15,
+            value=5,
+            step=2,
+            help="Inner guard window size (NxN) centered on the Cell Under Test (CUT). Excludes ship energy and sidelobes from leaking into the clutter estimation.",
+        )
+    with cfar_col2:
+        cfar_bg_size = st.slider(
+            "Background Window Size (px)",
+            min_value=max(7, cfar_guard_size + 2),
+            max_value=35,
+            value=max(15, cfar_guard_size + 2),
+            step=2,
+            help="Outer background training window size (NxN). Ocean pixels between the guard and outer boundary estimate the local clutter mean and standard deviation.",
+        )
+    with cfar_col3:
+        cfar_threshold_mult = st.slider(
+            "Threshold Multiplier (k)",
+            min_value=1.0,
+            max_value=15.0,
+            value=5.0,
+            step=0.5,
+            help="CFAR detection sensitivity multiplier k. Threshold = μ_bg + (k × σ_bg). Higher k suppresses false alarms; lower k increases sensitivity.",
+        )
+
+    # Run CA-CFAR on the Gaussian Filter output array (strictly in Linear Power)
+    target_gaussian_array = filtered_dict[gauss_name]
+    cfar_binary_mask = detect_vessels_cfar(
+        linear_sar_array=target_gaussian_array,
+        guard_size=cfar_guard_size,
+        bg_size=cfar_bg_size,
+        threshold_multiplier=cfar_threshold_mult,
+    )
+
+    # Extract detected vessels using connected components
+    detected_vessel_pixels = int(np.nansum(cfar_binary_mask == 1.0))
+    valid_ocean_pixels = int(np.sum(~np.isnan(cfar_binary_mask)))
+    vessel_ocean_pct = (detected_vessel_pixels / valid_ocean_pixels * 100.0) if valid_ocean_pixels > 0 else 0.0
+
+    labeled_targets, num_detected_targets = ndimage.label(cfar_binary_mask == 1.0)
+    detected_centroids = []
+    if num_detected_targets > 0:
+        raw_centers = ndimage.center_of_mass(
+            cfar_binary_mask, labeled_targets, range(1, num_detected_targets + 1)
+        )
+        detected_centroids = [(float(r), float(c)) for r, c in raw_centers]
+
+    # --- Metrics Row ---
+    cfar_m1, cfar_m2, cfar_m3, cfar_m4 = st.columns(4)
+    with cfar_m1:
+        st.metric(
+            "Detected Vessels",
+            f"{num_detected_targets}",
+            delta=f"{detected_vessel_pixels:,} target pixels",
+            delta_color="normal" if num_detected_targets > 0 else "off",
+        )
+    with cfar_m2:
+        st.metric(
+            "CFAR Multiplier (k)",
+            f"{cfar_threshold_mult:.1f}σ",
+            delta=f"Guard: {cfar_guard_size}px | BG: {cfar_bg_size}px",
+            delta_color="off",
+        )
+    with cfar_m3:
+        st.metric(
+            "Target Footprint",
+            f"{vessel_ocean_pct:.3f}%",
+            delta=f"{detected_vessel_pixels:,} / {valid_ocean_pixels:,} px",
+            delta_color="off",
+        )
+    with cfar_m4:
+        masked_land_count = int(np.sum(np.isnan(sar_array)))
+        st.metric(
+            "Clutter Background",
+            f"{valid_ocean_pixels:,} px",
+            delta=f"{masked_land_count:,} land px masked" if masked_land_count > 0 else "100% ocean",
+            delta_color="off",
+        )
+
+    # --- Side-by-side Plot: Raw Linear SAR Image with Circles vs CFAR Binary Mask ---
+    fig_cfar, (ax_raw_cfar, ax_bin_cfar) = plt.subplots(
+        1, 2, figsize=(14, 6), facecolor="#14171A",
+        gridspec_kw={"wspace": 0.08},
+    )
+
+    # LEFT: Raw linear SAR image with red detection circles
+    ax_raw_cfar.set_facecolor("#0F1115")
+    valid_raw_pixels = sar_array[~np.isnan(sar_array)]
+    if valid_raw_pixels.size > 0:
+        v_min_raw = float(np.percentile(valid_raw_pixels, 1.0))
+        v_max_raw = float(np.percentile(valid_raw_pixels, contrast_percentile))
+    else:
+        v_min_raw, v_max_raw = 0.0, 1.0
+
+    cmap_raw_cfar = plt.get_cmap(colormap).copy()
+    cmap_raw_cfar.set_bad(color="#080A0C")
+    im_raw_cfar = ax_raw_cfar.imshow(
+        sar_array, cmap=cmap_raw_cfar, vmin=v_min_raw, vmax=v_max_raw, origin="upper"
+    )
+    ax_raw_cfar.set_title(
+        "Raw SAR Input (Linear Power) — Detected Vessel Coordinates",
+        color="#F5F8FA", fontsize=11, fontweight="bold", pad=10,
+    )
+
+    # Draw red circle around each detected vessel coordinate on the visual plot
+    target_circle_radius = 12
+    for idx, (r, c) in enumerate(detected_centroids, 1):
+        circle = patches.Circle(
+            (c, r), radius=target_circle_radius,
+            linewidth=2.0, edgecolor="#FF3366", facecolor="none",
+        )
+        ax_raw_cfar.add_patch(circle)
+        ax_raw_cfar.text(
+            c + target_circle_radius + 2, r + 4, f"Target #{idx}",
+            color="#FF3366", fontsize=8.5, fontweight="bold",
+            bbox=dict(
+                boxstyle="round,pad=0.2", facecolor="#14171A",
+                edgecolor="#FF3366", linewidth=1.0, alpha=0.85,
+            ),
+        )
+
+    cbar_raw_cfar = fig_cfar.colorbar(im_raw_cfar, ax=ax_raw_cfar, fraction=0.046, pad=0.04)
+    cbar_raw_cfar.set_label("Linear Radar Intensity", color="#E1E8ED", fontsize=9)
+    cbar_raw_cfar.ax.tick_params(colors="#8899A6", labelsize=8)
+
+    ax_raw_cfar.tick_params(colors="#8899A6", labelsize=8)
+    for s in ax_raw_cfar.spines.values():
+        s.set_edgecolor("#38444D")
+
+    # RIGHT: CFAR Binary Mask
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+    cfar_palette = ListedColormap(["#0A1628", "#00E676"])  # 0: Navy Ocean, 1: Electric Green Target
+    cfar_palette.set_bad(color="#080A0C")                  # NaN: DEM Land Mask
+
+    ax_bin_cfar.set_facecolor("#0F1115")
+    im_bin_cfar = ax_bin_cfar.imshow(
+        cfar_binary_mask, cmap=cfar_palette, vmin=0, vmax=1,
+        origin="upper", interpolation="nearest",
+    )
+    ax_bin_cfar.set_title(
+        "2D CA-CFAR Binary Mask (Vessel = Green, Ocean = Blue)",
+        color="#F5F8FA", fontsize=11, fontweight="bold", pad=10,
+    )
+
+    # Draw matching circles on the binary mask
+    for idx, (r, c) in enumerate(detected_centroids, 1):
+        circle_bin = patches.Circle(
+            (c, r), radius=target_circle_radius,
+            linewidth=1.8, edgecolor="#FF3366", facecolor="none", linestyle="--",
+        )
+        ax_bin_cfar.add_patch(circle_bin)
+
+    # Legend patch
+    cfar_legend_elements = [
+        Patch(facecolor="#0A1628", edgecolor="#38444D", label="Ocean Clutter (0)"),
+        Patch(facecolor="#00E676", edgecolor="#38444D", label="Detected Vessel (1)"),
+        Patch(facecolor="#080A0C", edgecolor="#38444D", label="Land (DEM Masked)"),
+    ]
+    ax_bin_cfar.legend(
+        handles=cfar_legend_elements, loc="lower right",
+        facecolor="#1F242D", edgecolor="#38444D", labelcolor="#E1E8ED",
+        fontsize=8.5, framealpha=0.9,
+    )
+
+    # Detection summary badge
+    badge_cfar_text = (
+        f"Detections: {num_detected_targets} vessels\n"
+        f"Sensitivity: k={cfar_threshold_mult:.1f}σ"
+    )
+    ax_bin_cfar.text(
+        0.03, 0.96, badge_cfar_text,
+        transform=ax_bin_cfar.transAxes, color="#FFFFFF", fontsize=9.5,
+        fontweight="bold", va="top", ha="left",
+        bbox=dict(
+            boxstyle="round,pad=0.35", facecolor="#1F242D",
+            edgecolor="#00E676", linewidth=1.5, alpha=0.92,
+        ),
+    )
+
+    ax_bin_cfar.tick_params(colors="#8899A6", labelsize=8)
+    for s in ax_bin_cfar.spines.values():
+        s.set_edgecolor("#38444D")
+
+    plt.subplots_adjust(left=0.04, right=0.92, top=0.92, bottom=0.06)
+    st.pyplot(fig_cfar, clear_figure=True)
+
+    # --- Detected Targets Telemetry Table ---
+    if num_detected_targets > 0:
+        st.markdown("#### 📋 Detected Target Telemetry & Radar Cross-Section")
+        target_rows = []
+        for idx, (r, c) in enumerate(detected_centroids, 1):
+            ir, ic = int(round(r)), int(round(c))
+            raw_peak = (
+                float(sar_array[ir, ic])
+                if (0 <= ir < sar_array.shape[0] and 0 <= ic < sar_array.shape[1] and not np.isnan(sar_array[ir, ic]))
+                else 0.0
+            )
+            gauss_val = (
+                float(target_gaussian_array[ir, ic])
+                if (0 <= ir < target_gaussian_array.shape[0] and 0 <= ic < target_gaussian_array.shape[1] and not np.isnan(target_gaussian_array[ir, ic]))
+                else 0.0
+            )
+            px_count = int(np.sum(labeled_targets == idx))
+
+            target_rows.append({
+                "Target ID": f"Target #{idx}",
+                "Centroid (Row, Col)": f"({r:.1f}, {c:.1f})",
+                "Raw SAR Peak (Linear)": f"{raw_peak:.2f}",
+                "Gaussian Intensity": f"{gauss_val:.2f}",
+                "Cluster Footprint": f"{px_count} px",
+            })
+        st.table(target_rows)
+
+        if is_synthetic and vessel_coords:
+            st.info(
+                f"🎯 **Ground Truth Verification**: Synthetic physics simulation contains "
+                f"{len(vessel_coords)} simulated vessel point targets at: "
+                + ", ".join([f"Target #{i+1} @ {coord}" for i, coord in enumerate(vessel_coords)])
+            )
+    else:
+        st.info("ℹ️ No vessels detected at current threshold. Lower the Threshold Multiplier slider to increase detection sensitivity.")
+
