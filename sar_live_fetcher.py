@@ -188,6 +188,16 @@ class CopernicusCDSEFetcher:
         self.auth_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
         self.username = username or os.environ.get("CDSE_USERNAME")
         self.password = password or os.environ.get("CDSE_PASSWORD")
+
+        # Automatically check Streamlit secrets if running on Streamlit Cloud
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets"):
+                self.username = self.username or st.secrets.get("CDSE_USERNAME")
+                self.password = self.password or st.secrets.get("CDSE_PASSWORD")
+        except Exception:
+            pass
+
         self.token = None
 
     def authenticate(self) -> bool:
@@ -274,9 +284,30 @@ class EarthEngineSARFetcher:
     def initialize(self) -> Tuple[bool, str]:
         """
         Initializes the Earth Engine Python API.
+        Checks Streamlit Cloud secrets, local credentials, or project ID.
         """
         import ee
 
+        # 1. Check Streamlit Cloud Secrets (Service Account JSON or Project)
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets"):
+                if not self.project_id and "EE_PROJECT_ID" in st.secrets:
+                    self.project_id = st.secrets["EE_PROJECT_ID"]
+                if "EE_SERVICE_ACCOUNT_JSON" in st.secrets:
+                    import json
+                    key_dict = json.loads(st.secrets["EE_SERVICE_ACCOUNT_JSON"])
+                    credentials = ee.ServiceAccountCredentials(
+                        key_dict.get("client_email"),
+                        key_data=key_dict.get("private_key"),
+                    )
+                    ee.Initialize(credentials, project=self.project_id)
+                    self.is_initialized = True
+                    return True, f"Connected via Streamlit Cloud Secrets ({self.project_id})"
+        except Exception:
+            pass
+
+        # 2. Standard Local Authorization
         try:
             if self.project_id:
                 ee.Initialize(project=self.project_id)
@@ -287,8 +318,8 @@ class EarthEngineSARFetcher:
         except Exception as e:
             err_msg = (
                 f"GEE Initialization failed: {e}.\n"
-                "To authenticate, run 'earthengine authenticate' in terminal or "
-                "supply a Google Cloud project ID."
+                "To authenticate locally, run 'earthengine authenticate' in terminal. "
+                "On Streamlit Cloud, add EE_SERVICE_ACCOUNT_JSON or EE_PROJECT_ID to Secrets."
             )
             return False, err_msg
 
