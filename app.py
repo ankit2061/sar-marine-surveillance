@@ -69,6 +69,16 @@ gaussian_sigma = st.sidebar.slider(
     value=1.2,
     step=0.1,
 )
+
+# Radiometric Scaling
+st.sidebar.markdown("### 🎚️ Radiometric Scaling")
+scale_mode = st.sidebar.radio(
+    "Scale Mode",
+    options=["Linear Power", "Decibels (dB)"],
+    index=0,
+    help="Convert linear radar intensity to logarithmic decibels (10*log10(I)) to reveal subtle dark slicks without bright ships washing out the scene.",
+)
+
 colormap = st.sidebar.selectbox(
     "SAR Colormap",
     options=["viridis", "magma", "inferno", "cividis", "gray"],
@@ -321,21 +331,54 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🛰️ Satellite API & Provider Details",
 ])
 
+def apply_scaling(image_array: np.ndarray, scale_mode: str) -> np.ndarray:
+    """
+    Applies radiometric scaling to a 2D SAR backscatter intensity array.
+
+    Parameters
+    ----------
+    image_array : np.ndarray
+        Input 2D radar intensity array.
+    scale_mode : str
+        'Linear Power' or 'Decibels (dB)'.
+
+    Returns
+    -------
+    np.ndarray
+        Transformed array. In dB mode, clips to 1e-5 to prevent log(0) warnings.
+    """
+    if scale_mode == "Decibels (dB)":
+        return 10.0 * np.log10(np.clip(image_array, 1e-5, None))
+    return image_array
+
 with tab1:
     fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor="#14171A")
 
+    # Apply selected radiometric scaling directly before rendering in matplotlib
+    scaled_noisy = apply_scaling(noisy_scene, scale_mode)
+    scaled_mean = apply_scaling(filtered_dict[mean_name], scale_mode)
+    scaled_gauss = apply_scaling(filtered_dict[gauss_name], scale_mode)
+    scaled_lee = apply_scaling(filtered_dict[lee_name], scale_mode)
+
     plot_configs = [
-        (f"Raw Input ({scene_source_title[:28]})", noisy_scene, axes[0, 0], raw_enl, 100.0),
-        (f"Mean Box Filter ({window_size}x{window_size})", filtered_dict[mean_name], axes[0, 1], metrics["ENL"][mean_name], top_vessel_ret[mean_name]),
-        (f"Gaussian Filter (σ={gaussian_sigma:.1f})", filtered_dict[gauss_name], axes[1, 0], metrics["ENL"][gauss_name], top_vessel_ret[gauss_name]),
-        (f"Adaptive Lee Filter ({window_size}x{window_size})", filtered_dict[lee_name], axes[1, 1], metrics["ENL"][lee_name], top_vessel_ret[lee_name]),
+        (f"Raw Input ({scene_source_title[:28]})", scaled_noisy, axes[0, 0], raw_enl, 100.0),
+        (f"Mean Box Filter ({window_size}x{window_size})", scaled_mean, axes[0, 1], metrics["ENL"][mean_name], top_vessel_ret[mean_name]),
+        (f"Gaussian Filter (σ={gaussian_sigma:.1f})", scaled_gauss, axes[1, 0], metrics["ENL"][gauss_name], top_vessel_ret[gauss_name]),
+        (f"Adaptive Lee Filter ({window_size}x{window_size})", scaled_lee, axes[1, 1], metrics["ENL"][lee_name], top_vessel_ret[lee_name]),
     ]
 
     y_slice, x_slice = ocean_patch_slice
     roi_x, roi_y = x_slice.start, y_slice.start
     roi_w, roi_h = x_slice.stop - x_slice.start, y_slice.stop - y_slice.start
 
-    v_min, v_max = 0.0, float(np.percentile(noisy_scene, contrast_percentile))
+    # Adjust dynamic display range based on linear or logarithmic (dB) scale
+    if scale_mode == "Decibels (dB)":
+        v_min = float(np.percentile(scaled_noisy, 1.0))
+        v_max = float(np.percentile(scaled_noisy, contrast_percentile))
+    else:
+        v_min = 0.0
+        v_max = float(np.percentile(scaled_noisy, contrast_percentile))
+
     ship1_r, ship1_c = vessel_coords[0]
     inset_half_size = 22
     r_min, r_max = max(0, ship1_r - inset_half_size), min(512, ship1_r + inset_half_size)
@@ -382,7 +425,12 @@ with tab1:
 
     cbar_ax = fig.add_axes([0.2, 0.045, 0.6, 0.015])
     cbar = fig.colorbar(im, cax=cbar_ax, orientation="horizontal")
-    cbar.set_label("SAR Backscatter Intensity (Linear Power)", color="#E1E8ED", fontsize=10)
+    cbar_label = (
+        "SAR Backscatter Intensity (dB = 10·log₁₀(I))"
+        if scale_mode == "Decibels (dB)"
+        else "SAR Backscatter Intensity (Linear Power)"
+    )
+    cbar.set_label(cbar_label, color="#E1E8ED", fontsize=10)
     cbar.ax.tick_params(colors="#8899A6", labelsize=8)
     plt.subplots_adjust(left=0.04, right=0.96, top=0.96, bottom=0.08, wspace=0.1, hspace=0.14)
 
